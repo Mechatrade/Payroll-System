@@ -304,8 +304,10 @@
   // These are approximations of the official bracket tables — verify against BIR/SSS/PhilHealth/Pag-IBIG
   // circulars before relying on them for actual remittance.
   const STATUTORY_2026 = {
-    sss: { rateTotal: 0.15, employeeShare: 0.05, mscFloor: 5000, mscCeiling: 35000, mscStep: 500 },
+    sss: { rateTotal: 0.15, employeeShare: 0.05, mscFloor: 5000, mscCeiling: 35000, mscStep: 500, ecThreshold: 15000, ecBelow: 10, ecAtOrAbove: 30 },
     philhealth: { rateTotal: 0.05, employeeShare: 0.025, floor: 10000, ceiling: 100000 },
+    // Pag-IBIG MFS cap is ₱10,000 as of HDMF Circular 460 (effective Feb 2024, current through 2026).
+    // The older ₱5,000 cap / ₱100 max predates that circular — do not revert to it.
     pagibig: { rateLow: 0.01, rateStandard: 0.02, lowThreshold: 1500, mfsCap: 10000 },
     // Monthly TRAIN withholding brackets: [floor, baseTax, rate]
     taxMonthly: [
@@ -367,6 +369,11 @@
       const t = STATUTORY_2026.sss;
       return Math.round(this.sssMSC(monthlyComp) * (t.rateTotal - t.employeeShare) * 100) / 100;
     },
+    // Employer-only fixed EC (Employees' Compensation) premium, on top of the 10% employer SS share.
+    sssEC(monthlyComp) {
+      const t = STATUTORY_2026.sss;
+      return this.sssMSC(monthlyComp) >= t.ecThreshold ? t.ecAtOrAbove : t.ecBelow;
+    },
     philhealthEmployeeShare(monthlyComp) {
       const t = STATUTORY_2026.philhealth;
       const base = Math.min(Math.max(monthlyComp, t.floor), t.ceiling);
@@ -427,6 +434,7 @@
 
       const sss = this.sssEmployeeShare(monthlyComp) * statutoryMultiplier;
       const sssEmployer = this.sssEmployerShare(monthlyComp) * statutoryMultiplier;
+      const sssEC = this.sssEC(monthlyComp) * statutoryMultiplier;
       const philhealth = this.philhealthEmployeeShare(monthlyComp) * statutoryMultiplier;
       const philhealthEmployer = this.philhealthEmployerShare(monthlyComp) * statutoryMultiplier;
       const pagibig = this.pagibigEmployeeShare(monthlyComp) * statutoryMultiplier;
@@ -442,7 +450,7 @@
       return {
         basic, ot, holidayPay, restDayPay, otherEarnings,
         unpaidAbsenceDeduction, unpaidLeaveDeduction,
-        gross, sss, sssEmployer, philhealth, philhealthEmployer, pagibig, pagibigEmployer, tax,
+        gross, sss, sssEmployer, sssEC, philhealth, philhealthEmployer, pagibig, pagibigEmployer, tax,
         otherDeductions, totalDeductions, net,
         contributionMonth: this.contributionMonth(period), cutoffPosition
       };
@@ -972,7 +980,7 @@
     const logoSrc = logoImg ? logoImg.src : '';
     const f = (n) => (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
 
-    let totals = { gross: 0, sss: 0, philhealth: 0, pagibig: 0, tax: 0, deductions: 0, net: 0, sssEmployer: 0, philhealthEmployer: 0, pagibigEmployer: 0 };
+    let totals = { gross: 0, sss: 0, philhealth: 0, pagibig: 0, tax: 0, deductions: 0, net: 0, sssEmployer: 0, sssEC: 0, philhealthEmployer: 0, pagibigEmployer: 0 };
     const lineRows = records.map(rec => {
       const emp = employeesCache.find(e => e.id === rec.employee_id);
       totals.gross += rec.gross || 0;
@@ -983,6 +991,7 @@
       totals.deductions += rec.totalDeductions || 0;
       totals.net += rec.net || 0;
       totals.sssEmployer += rec.sssEmployer || 0;
+      totals.sssEC += rec.sssEC || 0;
       totals.philhealthEmployer += rec.philhealthEmployer || 0;
       totals.pagibigEmployer += rec.pagibigEmployer || 0;
       return `
@@ -1098,6 +1107,7 @@
         <thead><tr><th colspan="2" style="text-align:left; font-size:11px; color:var(--muted);">Employer share (company cost, not deducted from employee)</th></tr></thead>
         <tbody>
           ${line('SSS (employer)', rec.sssEmployer)}
+          ${line('SSS EC (employer)', rec.sssEC)}
           ${line('PhilHealth (employer)', rec.philhealthEmployer)}
           ${line('Pag-IBIG (employer)', rec.pagibigEmployer)}
         </tbody>
@@ -1334,6 +1344,7 @@
       <div class="stat-cell"><div class="stat-label">Total Pag-IBIG (employee)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.pagibig)}</div></div>
       <div class="stat-cell"><div class="stat-label">Total withholding tax</div><div class="stat-value" style="font-size:17px;">${f(built.totals.tax)}</div></div>
       <div class="stat-cell"><div class="stat-label">Total SSS (employer)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.sssEmployer)}</div></div>
+      <div class="stat-cell"><div class="stat-label">Total SSS EC (employer)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.sssEC)}</div></div>
       <div class="stat-cell"><div class="stat-label">Total PhilHealth (employer)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.philhealthEmployer)}</div></div>
       <div class="stat-cell"><div class="stat-label">Total Pag-IBIG (employer)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.pagibigEmployer)}</div></div>
     `;
