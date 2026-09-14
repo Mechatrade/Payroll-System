@@ -87,6 +87,17 @@
 
     document.getElementById('logout-btn').addEventListener('click', () => signOut(auth));
 
+    document.querySelectorAll('.toggle-password').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const input = document.getElementById(btn.dataset.target);
+        const showing = input.type === 'text';
+        input.type = showing ? 'password' : 'text';
+        btn.querySelector('.icon-eye').classList.toggle('hidden', !showing);
+        btn.querySelector('.icon-eye-off').classList.toggle('hidden', showing);
+        btn.setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
+      });
+    });
+
     document.getElementById('toggle-signup').addEventListener('click', () => {
       document.getElementById('login-form').classList.add('hidden');
       document.getElementById('signup-form').classList.remove('hidden');
@@ -488,6 +499,24 @@
     border-color: var(--navy);
   }
 
+  .password-field { position: relative; }
+  .password-field input { padding-right: 38px; }
+  .toggle-password {
+    position: absolute;
+    right: 6px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    padding: 6px;
+    cursor: pointer;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+  }
+  .toggle-password:hover { color: var(--navy); }
+  .toggle-password:focus-visible { outline: 2px solid var(--gold); outline-offset: 1px; }
+
   .btn-primary {
     width: 100%;
     padding: 11px;
@@ -712,7 +741,13 @@
     </div>
     <div class="field">
       <label for="login-password">Password</label>
-      <input type="password" id="login-password" required autocomplete="current-password">
+      <div class="password-field">
+        <input type="password" id="login-password" required autocomplete="current-password">
+        <button type="button" class="toggle-password" data-target="login-password" aria-label="Show password">
+          <svg class="icon-eye" viewBox="0 0 20 20" width="16" height="16"><path d="M10 4C5.5 4 2 10 2 10s3.5 6 8 6 8-6 8-6-3.5-6-8-6zm0 10a4 4 0 110-8 4 4 0 010 8z" fill="currentColor"/><circle cx="10" cy="10" r="1.8" fill="var(--paper)"/></svg>
+          <svg class="icon-eye-off hidden" viewBox="0 0 20 20" width="16" height="16"><path d="M3 3l14 14M8.3 8.4a2.5 2.5 0 003.3 3.3M6.1 6.2C3.9 7.4 2 10 2 10s3.5 6 8 6c1.4 0 2.7-.5 3.9-1.2M10 4c4.5 0 8 6 8 6a13.6 13.6 0 01-2.3 2.9" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>
+        </button>
+      </div>
     </div>
     <button type="submit" class="btn-primary">Sign in</button>
     <div class="login-error" id="login-error"></div>
@@ -730,11 +765,23 @@
     </div>
     <div class="field">
       <label for="signup-password">Password</label>
-      <input type="password" id="signup-password" required autocomplete="new-password" minlength="6">
+      <div class="password-field">
+        <input type="password" id="signup-password" required autocomplete="new-password" minlength="6">
+        <button type="button" class="toggle-password" data-target="signup-password" aria-label="Show password">
+          <svg class="icon-eye" viewBox="0 0 20 20" width="16" height="16"><path d="M10 4C5.5 4 2 10 2 10s3.5 6 8 6 8-6 8-6-3.5-6-8-6zm0 10a4 4 0 110-8 4 4 0 010 8z" fill="currentColor"/><circle cx="10" cy="10" r="1.8" fill="var(--paper)"/></svg>
+          <svg class="icon-eye-off hidden" viewBox="0 0 20 20" width="16" height="16"><path d="M3 3l14 14M8.3 8.4a2.5 2.5 0 003.3 3.3M6.1 6.2C3.9 7.4 2 10 2 10s3.5 6 8 6c1.4 0 2.7-.5 3.9-1.2M10 4c4.5 0 8 6 8 6a13.6 13.6 0 01-2.3 2.9" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>
+        </button>
+      </div>
     </div>
     <div class="field">
       <label for="signup-password-confirm">Confirm password</label>
-      <input type="password" id="signup-password-confirm" required autocomplete="new-password" minlength="6">
+      <div class="password-field">
+        <input type="password" id="signup-password-confirm" required autocomplete="new-password" minlength="6">
+        <button type="button" class="toggle-password" data-target="signup-password-confirm" aria-label="Show password">
+          <svg class="icon-eye" viewBox="0 0 20 20" width="16" height="16"><path d="M10 4C5.5 4 2 10 2 10s3.5 6 8 6 8-6 8-6-3.5-6-8-6zm0 10a4 4 0 110-8 4 4 0 010 8z" fill="currentColor"/><circle cx="10" cy="10" r="1.8" fill="var(--paper)"/></svg>
+          <svg class="icon-eye-off hidden" viewBox="0 0 20 20" width="16" height="16"><path d="M3 3l14 14M8.3 8.4a2.5 2.5 0 003.3 3.3M6.1 6.2C3.9 7.4 2 10 2 10s3.5 6 8 6c1.4 0 2.7-.5 3.9-1.2M10 4c4.5 0 8 6 8 6a13.6 13.6 0 01-2.3 2.9" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>
+        </button>
+      </div>
     </div>
     <button type="submit" class="btn-primary">Create account</button>
     <div class="login-error" id="signup-error"></div>
