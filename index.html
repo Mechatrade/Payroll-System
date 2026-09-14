@@ -444,13 +444,17 @@
       const tax = this.withholdingTax(taxableIncome) * taxPeriodFactor;
 
       const totalDeductions = sss + philhealth + pagibig + tax + otherDeductions;
-      const net = gross - totalDeductions;
+      const grossRaw = gross;
+      gross = Math.max(gross, 0);
+      const netRaw = gross - totalDeductions;
+      const net = Math.max(netRaw, 0);
+      const needsReview = grossRaw < 0 || netRaw < 0;
 
       return {
         basic, ot, holidayPay, restDayPay, otherEarnings,
         unpaidDeduction,
-        gross, sss, sssEmployer, sssEC, philhealth, philhealthEmployer, pagibig, pagibigEmployer, tax,
-        otherDeductions, totalDeductions, net,
+        gross, grossRaw, sss, sssEmployer, sssEC, philhealth, philhealthEmployer, pagibig, pagibigEmployer, tax,
+        otherDeductions, totalDeductions, net, netRaw, needsReview,
         contributionMonth: this.contributionMonth(period), cutoffPosition
       };
     }
@@ -880,7 +884,11 @@
     const rec = window.__mpCalc.computeRecord(emp, inputs, period, taxFactor);
     tr.querySelector('.result-gross').textContent = '₱' + rec.gross.toLocaleString('en-PH', {minimumFractionDigits: 2});
     tr.querySelector('.result-deductions').textContent = '₱' + rec.totalDeductions.toLocaleString('en-PH', {minimumFractionDigits: 2});
-    tr.querySelector('.result-net').textContent = '₱' + rec.net.toLocaleString('en-PH', {minimumFractionDigits: 2});
+    const netCell = tr.querySelector('.result-net');
+    netCell.textContent = '₱' + rec.net.toLocaleString('en-PH', {minimumFractionDigits: 2});
+    if (rec.needsReview) {
+      netCell.innerHTML += ` <span class="tag" style="border-color:var(--red); color:var(--red);" title="Deductions exceeded pay before flooring — raw gross ₱${rec.grossRaw.toFixed(2)}, raw net ₱${rec.netRaw.toFixed(2)}. Check attendance data for this employee.">⚠ Review</span>`;
+    }
     tr.dataset.record = JSON.stringify(rec);
   }
 
@@ -993,7 +1001,7 @@
       totals.pagibigEmployer += rec.pagibigEmployer || 0;
       return `
         <tr>
-          <td>${emp ? emp.name : rec.employee_id}</td>
+          <td>${emp ? emp.name : rec.employee_id}${rec.needsReview ? ' <span style="color:var(--red); font-size:11px;" title="Deductions exceeded pay before flooring — check attendance data">⚠</span>' : ''}</td>
           <td>${f(rec.gross)}</td><td>${f(rec.sss)}</td><td>${f(rec.philhealth)}</td>
           <td>${f(rec.pagibig)}</td><td>${f(rec.tax)}</td><td>${f(rec.totalDeductions)}</td><td>${f(rec.net)}</td>
         </tr>`;
@@ -1097,6 +1105,7 @@
       <table class="sheet-table" style="max-width:420px; margin-top:18px;">
         <tbody><tr style="font-weight:600;"><td>Net pay</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace; font-size:14px;">₱${f(rec.net)}</td></tr></tbody>
       </table>
+      ${rec.needsReview ? `<div style="margin-top:10px; font-size:11.5px; color:var(--red); border-left:2px solid var(--red); padding-left:10px;">⚠ Deductions exceeded pay before flooring to ₱0 — raw gross ₱${f(rec.grossRaw)}, raw net ₱${f(rec.netRaw)}. Check this employee's attendance data before releasing.</div>` : ''}
       <table class="sheet-table" style="max-width:420px; margin-top:18px;">
         <thead><tr><th colspan="2" style="text-align:left; font-size:11px; color:var(--muted);">Employer share (company cost, not deducted from employee)</th></tr></thead>
         <tbody>
