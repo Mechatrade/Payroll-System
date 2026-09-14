@@ -32,7 +32,24 @@
   const app = initializeApp(firebaseConfig);
   const auth = getAuth(app);
   const db = getFirestore(app);
-  window.__mp = { auth, db, signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut,
+
+  // ---- Mechatrade PulseTime (timetracker) — read-only connection ----
+  // Payroll never writes here. It reads raw time-in/time-out for a cutoff's
+  // date range, then copies it into payroll's own `attendance` collection
+  // (see the Attendance module) so processed payroll stays reproducible even
+  // if PulseTime records are edited afterward.
+  const timetrackerConfig = {
+    apiKey: "AIzaSyCCjq_qDVIZ3YYnPgPuuPI0NFuLMoz9nCU",
+    authDomain: "mechatrade-pulsetime.firebaseapp.com",
+    projectId: "mechatrade-pulsetime",
+    storageBucket: "mechatrade-pulsetime.firebasestorage.app",
+    messagingSenderId: "510523514828",
+    appId: "1:510523514828:web:139f728fa231406d284769"
+  };
+  const ttApp = initializeApp(timetrackerConfig, "timetracker");
+  const dbTimetracker = getFirestore(ttApp);
+
+  window.__mp = { auth, db, dbTimetracker, signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut,
     collection, doc, addDoc, updateDoc, deleteDoc, getDocs, getDoc, setDoc, runTransaction, query, orderBy, onSnapshot, serverTimestamp };
 
   // ---------- App bootstrap ----------
@@ -148,6 +165,8 @@
       e.target.dataset.type = e.target.value;
       if (currentPeriodId) renderProcessingTable();
     });
+    document.getElementById('pull-pulsetime-btn').addEventListener('click', pullFromPulseTime);
+    document.getElementById('save-attendance-btn').addEventListener('click', saveAttendanceSnapshot);
   });
 
   // ---------- Employees ----------
@@ -155,6 +174,7 @@
     e.preventDefault();
     const emp = {
       name: document.getElementById('emp-name').value.trim(),
+      email: document.getElementById('emp-email').value.trim().toLowerCase(),
       position: document.getElementById('emp-position').value.trim(),
       department: document.getElementById('emp-department').value.trim(),
       rate_type: document.getElementById('rate-type').value,
@@ -184,7 +204,7 @@
         if (d.rate_type === 'daily') dailyCount++; else monthlyCount++;
         rows.push(`
           <tr>
-            <td>${d.name}</td>
+            <td>${d.name}<div style="font-size:11px;color:var(--muted);">${d.email || '—'}</div></td>
             <td>${d.position || '—'}</td>
             <td>${d.department || '—'}</td>
             <td><span class="tag tag-${d.rate_type}">${d.rate_type}</span></td>
@@ -293,9 +313,123 @@
     }
   };
 
-  // ---------- Payroll Processing ----------
-  let currentPeriodId = null;
-  let employeesCache = [];
+  // ---------- Attendance (pulled from Mechatrade PulseTime) ----------
+  let pulledSummary = null; // { [employeeId]: { name, email, daysPresent, totalHours, otHours } }, plus _unmatched[]
+
+  async function pullFromPulseTime() {
+    const periodId = document.getElementById('att-period-select').value;
+    if (!periodId) { alert('Select a payroll period first.'); return; }
+    const period = periodsCache.find(p => p.id === periodId);
+    if (!period) return;
+
+    const btn = document.getElementById('pull-pulsetime-btn');
+    btn.disabled = true;
+    btn.textContent = 'Pulling…';
+
+    try {
+      // tt_entries has no employer-side security scoping beyond auth, so we
+      // pull the full recent set and filter client-side by the cutoff window.
+      const snap = await getDocs(collection(dbTimetracker, 'tt_entries'));
+      const cutoffStart = new Date(period.cutoff_start + 'T00:00:00');
+      const cutoffEnd = new Date(period.cutoff_end + 'T23:59:59');
+
+      const byEmail = {}; // email -> { datesHours: {date: hours}, totalHours }
+      snap.forEach(docSnap => {
+        const d = docSnap.data();
+        if (!d.start || !d.end || !d.ownerEmail) return;
+        const start = d.start.toDate();
+        if (start < cutoffStart || start > cutoffEnd) return;
+        const hours = (d.end.toDate() - start) / 3600000;
+        const dateKey = start.toISOString().slice(0, 10);
+        const email = d.ownerEmail.toLowerCase();
+        if (!byEmail[email]) byEmail[email] = { datesHours: {}, totalHours: 0 };
+        byEmail[email].datesHours[dateKey] = (byEmail[email].datesHours[dateKey] || 0) + hours;
+        byEmail[email].totalHours += hours;
+      });
+
+      const summary = { _unmatched: [] };
+      Object.entries(byEmail).forEach(([email, data]) => {
+        const emp = employeesCache.find(e => (e.email || '').toLowerCase() === email);
+        const daysPresent = Object.keys(data.datesHours).length;
+        const standardHours = daysPresent * 8;
+        const otHours = Math.max(Math.round((data.totalHours - standardHours) * 100) / 100, 0);
+        if (emp) {
+          summary[emp.id] = { name: emp.name, email, daysPresent, totalHours: Math.round(data.totalHours * 100) / 100, otHours };
+        } else {
+          summary._unmatched.push({ email, daysPresent, totalHours: Math.round(data.totalHours * 100) / 100 });
+        }
+      });
+
+      pulledSummary = summary;
+      renderAttendanceSummary();
+    } catch (err) {
+      alert('Could not read PulseTime data: ' + err.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Pull from PulseTime';
+    }
+  }
+
+  function renderAttendanceSummary() {
+    const wrap = document.getElementById('attendance-summary-wrap');
+    wrap.classList.remove('hidden');
+    const rows = Object.entries(pulledSummary).filter(([k]) => k !== '_unmatched').map(([empId, s]) => `
+      <tr>
+        <td>${s.name}<div style="font-size:11px;color:var(--muted);">${s.email}</div></td>
+        <td class="num">${s.daysPresent}</td>
+        <td class="num">${s.totalHours}</td>
+        <td class="num">${s.otHours}</td>
+      </tr>`).join('');
+    document.getElementById('attendance-summary-tbody').innerHTML = rows || `<tr><td colspan="4" class="empty">No matched entries for this cutoff.</td></tr>`;
+
+    const unmatched = pulledSummary._unmatched;
+    const unmatchedEl = document.getElementById('attendance-unmatched');
+    if (unmatched.length) {
+      unmatchedEl.classList.remove('hidden');
+      unmatchedEl.innerHTML = 'Unmatched PulseTime emails (no employee record with this email): ' +
+        unmatched.map(u => `${u.email} (${u.totalHours}h)`).join(', ');
+    } else {
+      unmatchedEl.classList.add('hidden');
+    }
+  }
+
+  async function saveAttendanceSnapshot() {
+    if (!pulledSummary) return;
+    const periodId = document.getElementById('att-period-select').value;
+    const btn = document.getElementById('save-attendance-btn');
+    btn.disabled = true;
+    btn.textContent = 'Saving…';
+    const entries = Object.entries(pulledSummary).filter(([k]) => k !== '_unmatched');
+    for (const [empId, s] of entries) {
+      await setDoc(doc(db, 'attendance', `${periodId}_${empId}`), {
+        control_number: periodId,
+        period_id: periodId,
+        employee_id: empId,
+        days_present: s.daysPresent,
+        total_hours: s.totalHours,
+        ot_hours: s.otHours,
+        source: 'pulsetime',
+        pulled_at: serverTimestamp()
+      });
+    }
+    btn.disabled = false;
+    btn.textContent = 'Save to payroll attendance';
+    alert('Attendance snapshot saved. Open this period in Payroll Processing to see it pre-filled.');
+  }
+
+  async function getAttendanceSnapshot(periodId, employeeId) {
+    try {
+      const snap = await getDoc(doc(db, 'attendance', `${periodId}_${employeeId}`));
+      return snap.exists() ? snap.data() : null;
+    } catch { return null; }
+  }
+
+  function populateAttendancePeriodSelect() {
+    const sel = document.getElementById('att-period-select');
+    if (!sel) return;
+    sel.innerHTML = periodsCache.map(p => `<option value="${p.id}">${p.cutoff_start} – ${p.cutoff_end}</option>`).join('') || '<option value="">No periods yet</option>';
+  }
+
 
   async function createPeriod(e) {
     e.preventDefault();
@@ -312,12 +446,16 @@
     e.target.reset();
   }
 
+  let periodsCache = [];
+
   function loadPeriods() {
     const q = query(collection(db, 'payroll_periods'), orderBy('cutoff_start', 'desc'));
     onSnapshot(q, (snap) => {
+      periodsCache = [];
       const rows = [];
       snap.forEach(docSnap => {
         const d = docSnap.data();
+        periodsCache.push({ id: docSnap.id, ...d });
         rows.push(`
           <tr>
             <td>${d.cutoff_start} &ndash; ${d.cutoff_end}</td>
@@ -328,6 +466,7 @@
           </tr>`);
       });
       document.getElementById('periods-tbody').innerHTML = rows.join('') || `<tr><td colspan="5" class="empty">No payroll periods yet. Create one above.</td></tr>`;
+      populateAttendancePeriodSelect();
     });
   }
 
@@ -337,15 +476,25 @@
     renderProcessingTable();
   };
 
-  function renderProcessingTable() {
+  async function renderProcessingTable() {
     const periodType = document.getElementById('period-type-active').dataset.type || 'semi-monthly';
     const factor = periodType === 'monthly' ? 1 : 0.5;
-    const rows = employeesCache.filter(e => e.status === 'active').map(emp => {
+    const activeEmployees = employeesCache.filter(e => e.status === 'active');
+
+    const snapshots = {};
+    await Promise.all(activeEmployees.map(async (emp) => {
+      snapshots[emp.id] = await getAttendanceSnapshot(currentPeriodId, emp.id);
+    }));
+
+    const rows = activeEmployees.map(emp => {
+      const snap = snapshots[emp.id];
+      const days = snap ? snap.days_present : 13;
+      const ot = snap ? snap.ot_hours : 0;
       return `
         <tr data-emp-id="${emp.id}">
-          <td>${emp.name}<div style="font-size:11px;color:var(--muted);">${emp.rate_type === 'daily' ? '₱' + emp.rate_amount + '/day' : '₱' + emp.rate_amount + '/mo'}</div></td>
-          <td><input type="number" class="cell-input" data-field="days" value="13" min="0" step="0.5" style="width:60px;"></td>
-          <td><input type="number" class="cell-input" data-field="ot" value="0" min="0" step="0.5" style="width:60px;"></td>
+          <td>${emp.name}<div style="font-size:11px;color:var(--muted);">${emp.rate_type === 'daily' ? '₱' + emp.rate_amount + '/day' : '₱' + emp.rate_amount + '/mo'}${snap ? ' · from PulseTime' : ''}</div></td>
+          <td><input type="number" class="cell-input" data-field="days" value="${days}" min="0" step="0.5" style="width:60px;"></td>
+          <td><input type="number" class="cell-input" data-field="ot" value="${ot}" min="0" step="0.5" style="width:60px;"></td>
           <td><input type="number" class="cell-input" data-field="allowances" value="0" min="0" step="0.01" style="width:70px;"></td>
           <td class="num result-gross">—</td>
           <td class="num result-deductions">—</td>
@@ -854,6 +1003,10 @@
               <input type="text" id="emp-name" required>
             </div>
             <div class="field">
+              <label for="emp-email">Email (PulseTime login)</label>
+              <input type="email" id="emp-email" placeholder="used to match timetracker entries">
+            </div>
+            <div class="field">
               <label for="emp-position">Position</label>
               <input type="text" id="emp-position">
             </div>
@@ -915,7 +1068,30 @@
 
     <!-- Placeholder views -->
     <section id="view-attendance" class="view hidden">
-      <div class="coming-soon"><h3>Attendance</h3>Daily time log entry and CSV import from biometrics — next module.</div>
+      <div class="panel">
+        <h3>Pull attendance from PulseTime</h3>
+        <div class="panel-sub">Reads raw time-in/time-out sessions for a cutoff's date range from Mechatrade PulseTime (read-only), matched to employees by email.</div>
+        <div class="form-grid" style="grid-template-columns: 2fr 1fr; align-items: end;">
+          <div class="field">
+            <label for="att-period-select">Payroll period</label>
+            <select id="att-period-select" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+          </div>
+          <button type="button" class="btn-add" id="pull-pulsetime-btn">Pull from PulseTime</button>
+        </div>
+      </div>
+
+      <div class="panel hidden" id="attendance-summary-wrap">
+        <h3>Pulled summary</h3>
+        <div class="panel-sub">Estimated OT is total hours beyond 8/day for the days present. Review before saving.</div>
+        <table>
+          <thead><tr><th>Employee</th><th class="num">Days present</th><th class="num">Total hours</th><th class="num">Est. OT hours</th></tr></thead>
+          <tbody id="attendance-summary-tbody"></tbody>
+        </table>
+        <div id="attendance-unmatched" class="hidden" style="margin-top:14px; font-size:12.5px; color:var(--red);"></div>
+        <div style="margin-top:18px;">
+          <button class="btn-add" id="save-attendance-btn">Save to payroll attendance</button>
+        </div>
+      </div>
     </section>
     <section id="view-processing" class="view hidden">
       <div class="panel">
