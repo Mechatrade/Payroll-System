@@ -17,7 +17,7 @@
   } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
   import {
     getFirestore, collection, doc, addDoc, updateDoc, deleteDoc,
-    getDocs, getDoc, setDoc, runTransaction, query, orderBy, onSnapshot, serverTimestamp
+    getDocs, getDoc, setDoc, runTransaction, query, where, orderBy, onSnapshot, serverTimestamp
   } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
 
   const firebaseConfig = {
@@ -62,7 +62,7 @@
   }
 
   window.__mp = { auth, db, dbTimetracker, signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut,
-    collection, doc, addDoc, updateDoc, deleteDoc, getDocs, getDoc, setDoc, runTransaction, query, orderBy, onSnapshot, serverTimestamp };
+    collection, doc, addDoc, updateDoc, deleteDoc, getDocs, getDoc, setDoc, runTransaction, query, where, orderBy, onSnapshot, serverTimestamp };
 
   // ---------- App bootstrap ----------
   let currentUserRole = null;
@@ -429,10 +429,14 @@
 
     try {
       await ensureTimetrackerAuth();
-      const snap = await getDocs(collection(dbTimetracker, 'tt_entries'));
       const cutoffStart = new Date(period.cutoff_start + 'T00:00:00');
       const cutoffEnd = new Date(period.cutoff_end + 'T23:59:59');
-
+      // Single-field range filter on `start` — no composite index needed,
+      // and this alone cuts reads down to just this cutoff's entries instead
+      // of pulling PulseTime's entire history on every pull.
+      const q = query(collection(dbTimetracker, 'tt_entries'),
+        where('start', '>=', cutoffStart), where('start', '<=', cutoffEnd));
+      const snap = await getDocs(q);
       // byEmailDate[email][date] = { spanMinutes, earliestStart, latestEnd }
       const byEmailDate = {};
       const unmatchedEmails = new Set();
@@ -618,13 +622,11 @@
   // summary shape Payroll Processing pre-fills from (days present, OT, etc).
   async function getAttendanceSnapshot(periodId, employeeId) {
     try {
-      const q = query(collection(db, 'attendance'), orderBy('date'));
+      const q = query(collection(db, 'attendance'),
+        where('period_id', '==', periodId), where('employee_id', '==', employeeId));
       const snap = await getDocs(q);
       const days = [];
-      snap.forEach(d => {
-        const data = d.data();
-        if (data.period_id === periodId && data.employee_id === employeeId) days.push(data);
-      });
+      snap.forEach(d => days.push(d.data()));
       if (!days.length) return null;
 
       let daysPresent = 0, totalHours = 0, otHours = 0, undertimeMinutes = 0;
@@ -1003,10 +1005,11 @@
   }
 
   async function fetchRecordsForPeriod(periodId) {
-    const q = query(collection(db, 'payroll_records'), orderBy('employee_id'));
+    const q = query(collection(db, 'payroll_records'), where('period_id', '==', periodId));
     const snap = await getDocs(q);
     const records = [];
-    snap.forEach(d => { const data = d.data(); if (data.period_id === periodId) records.push({ id: d.id, ...data }); });
+    snap.forEach(d => records.push({ id: d.id, ...d.data() }));
+    records.sort((a, b) => (a.employee_id || '').localeCompare(b.employee_id || ''));
     return records;
   }
 
