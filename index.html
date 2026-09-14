@@ -387,8 +387,34 @@
   let periodsCache = [];
   let editingEmployeeId = null;
 
-  // ---------- Attendance (pulled from Mechatrade PulseTime) ----------
-  let pulledSummary = null; // { [employeeId]: { name, email, daysPresent, totalHours, otHours } }, plus _unmatched[]
+  // ---------- Attendance (per-day records, pulled from Mechatrade PulseTime) ----------
+  // Business rules (confirmed): standard day = 8 worked hours + 1hr unpaid lunch,
+  // no fixed clock-in time (so "Late" isn't auto-computed from raw punches —
+  // it stays 0/manual unless corrected). A calendar day with zero PulseTime
+  // entries auto-flags as Leave and needs an Attendance Status picked before
+  // saving. Only PAID LEAVE counts as a paid day in payroll; UNPAID LEAVE,
+  // EMERGENCY LEAVE, and HALF DAY do not auto-count toward basic pay.
+  const ATTENDANCE_STATUSES = [
+    { value: '', label: '— select —' },
+    { value: 'PAID_LEAVE', label: 'Paid Leave' },
+    { value: 'UNPAID_LEAVE', label: 'Unpaid Leave' },
+    { value: 'EMERGENCY_LEAVE', label: 'Emergency Leave' },
+    { value: 'HALF_DAY', label: 'Half Day' }
+  ];
+
+  let pulledDays = null; // array of { employeeId, employeeName, date, timeIn, timeOut, regularHours, otHours, undertimeMinutes, isLeave, attendanceStatus }
+  let pulledUnmatched = [];
+
+  function dateRangeInclusive(startStr, endStr) {
+    const dates = [];
+    let d = new Date(startStr + 'T00:00:00');
+    const end = new Date(endStr + 'T00:00:00');
+    while (d <= end) {
+      dates.push(d.toISOString().slice(0, 10));
+      d.setDate(d.getDate() + 1);
+    }
+    return dates;
+  }
 
   async function pullFromPulseTime() {
     const periodId = document.getElementById('att-period-select').value;
@@ -402,40 +428,65 @@
 
     try {
       await ensureTimetrackerAuth();
-      // tt_entries has no employer-side security scoping beyond auth, so we
-      // pull the full recent set and filter client-side by the cutoff window.
       const snap = await getDocs(collection(dbTimetracker, 'tt_entries'));
       const cutoffStart = new Date(period.cutoff_start + 'T00:00:00');
       const cutoffEnd = new Date(period.cutoff_end + 'T23:59:59');
 
-      const byEmail = {}; // email -> { datesHours: {date: hours}, totalHours }
+      // byEmailDate[email][date] = { spanMinutes, earliestStart, latestEnd }
+      const byEmailDate = {};
+      const unmatchedEmails = new Set();
       snap.forEach(docSnap => {
         const d = docSnap.data();
         if (!d.start || !d.end || !d.ownerEmail) return;
         const start = d.start.toDate();
+        const end = d.end.toDate();
         if (start < cutoffStart || start > cutoffEnd) return;
-        const hours = (d.end.toDate() - start) / 3600000;
-        const dateKey = start.toISOString().slice(0, 10);
         const email = d.ownerEmail.toLowerCase();
-        if (!byEmail[email]) byEmail[email] = { datesHours: {}, totalHours: 0 };
-        byEmail[email].datesHours[dateKey] = (byEmail[email].datesHours[dateKey] || 0) + hours;
-        byEmail[email].totalHours += hours;
+        const dateKey = start.toISOString().slice(0, 10);
+        if (!byEmailDate[email]) byEmailDate[email] = {};
+        if (!byEmailDate[email][dateKey]) byEmailDate[email][dateKey] = { spanMinutes: 0, earliestStart: start, latestEnd: end };
+        const bucket = byEmailDate[email][dateKey];
+        bucket.spanMinutes += (end - start) / 60000;
+        if (start < bucket.earliestStart) bucket.earliestStart = start;
+        if (end > bucket.latestEnd) bucket.latestEnd = end;
+        if (!employeesCache.find(e => (e.email || '').toLowerCase() === email)) unmatchedEmails.add(email);
       });
 
-      const summary = { _unmatched: [] };
-      Object.entries(byEmail).forEach(([email, data]) => {
-        const emp = employeesCache.find(e => (e.email || '').toLowerCase() === email);
-        const daysPresent = Object.keys(data.datesHours).length;
-        const standardHours = daysPresent * 8;
-        const otHours = Math.max(Math.round((data.totalHours - standardHours) * 100) / 100, 0);
-        if (emp) {
-          summary[emp.id] = { name: emp.name, email, daysPresent, totalHours: Math.round(data.totalHours * 100) / 100, otHours };
-        } else {
-          summary._unmatched.push({ email, daysPresent, totalHours: Math.round(data.totalHours * 100) / 100 });
-        }
+      const dates = dateRangeInclusive(period.cutoff_start, period.cutoff_end);
+      const activeEmployees = employeesCache.filter(e => e.status === 'active' && e.email);
+      const rows = [];
+
+      activeEmployees.forEach(emp => {
+        const email = emp.email.toLowerCase();
+        dates.forEach(dateKey => {
+          const entry = byEmailDate[email] && byEmailDate[email][dateKey];
+          if (entry) {
+            const lunchMinutes = entry.spanMinutes > 60 ? 60 : 0;
+            const workedMinutes = Math.max(entry.spanMinutes - lunchMinutes, 0);
+            const regularMinutes = Math.min(workedMinutes, 8 * 60);
+            const otMinutes = Math.max(workedMinutes - 8 * 60, 0);
+            const undertimeMinutes = Math.max(8 * 60 - workedMinutes, 0);
+            rows.push({
+              employeeId: emp.id, employeeName: emp.name, date: dateKey,
+              timeIn: entry.earliestStart.toISOString(), timeOut: entry.latestEnd.toISOString(),
+              regularHours: Math.round((regularMinutes / 60) * 100) / 100,
+              otHours: Math.round((otMinutes / 60) * 100) / 100,
+              lateMinutes: 0,
+              undertimeMinutes: Math.round(undertimeMinutes),
+              isLeave: false, attendanceStatus: ''
+            });
+          } else {
+            rows.push({
+              employeeId: emp.id, employeeName: emp.name, date: dateKey,
+              timeIn: null, timeOut: null, regularHours: 0, otHours: 0,
+              lateMinutes: 0, undertimeMinutes: 0, isLeave: true, attendanceStatus: ''
+            });
+          }
+        });
       });
 
-      pulledSummary = summary;
+      pulledDays = rows;
+      pulledUnmatched = Array.from(unmatchedEmails);
       renderAttendanceSummary();
     } catch (err) {
       alert('Could not read PulseTime data: ' + err.message);
@@ -448,54 +499,110 @@
   function renderAttendanceSummary() {
     const wrap = document.getElementById('attendance-summary-wrap');
     wrap.classList.remove('hidden');
-    const rows = Object.entries(pulledSummary).filter(([k]) => k !== '_unmatched').map(([empId, s]) => `
-      <tr>
-        <td>${s.name}<div style="font-size:11px;color:var(--muted);">${s.email}</div></td>
-        <td class="num">${s.daysPresent}</td>
-        <td class="num">${s.totalHours}</td>
-        <td class="num">${s.otHours}</td>
-      </tr>`).join('');
-    document.getElementById('attendance-summary-tbody').innerHTML = rows || `<tr><td colspan="4" class="empty">No matched entries for this cutoff.</td></tr>`;
+    const statusOptions = (selected) => ATTENDANCE_STATUSES.map(s =>
+      `<option value="${s.value}" ${s.value === selected ? 'selected' : ''}>${s.label}</option>`).join('');
+    const fmtTime = (iso) => iso ? new Date(iso).toLocaleString('en-PH', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—';
 
-    const unmatched = pulledSummary._unmatched;
+    const rows = (pulledDays || []).map((r, idx) => `
+      <tr data-row-idx="${idx}">
+        <td>${r.employeeName}</td>
+        <td>${r.date}</td>
+        <td>${fmtTime(r.timeIn)}</td>
+        <td>${fmtTime(r.timeOut)}</td>
+        <td class="num">${r.regularHours}</td>
+        <td class="num">${r.otHours}</td>
+        <td class="num">${r.undertimeMinutes}</td>
+        <td>${r.isLeave ? '<span class="tag" style="border-color:var(--red); color:var(--red);">Leave</span>' : '—'}</td>
+        <td>
+          <select class="att-status-select" data-idx="${idx}" style="width:100%; padding:6px 8px; border:1px solid var(--line); background:${r.isLeave ? '#FFF8EC' : 'var(--paper)'}; font-family:inherit; font-size:12.5px;">
+            ${statusOptions(r.attendanceStatus)}
+          </select>
+        </td>
+      </tr>`).join('');
+    document.getElementById('attendance-summary-tbody').innerHTML = rows || `<tr><td colspan="9" class="empty">No active employees with an email on file, or no data for this cutoff.</td></tr>`;
+
+    document.querySelectorAll('.att-status-select').forEach(sel => {
+      sel.addEventListener('change', (e) => {
+        const idx = parseInt(e.target.dataset.idx, 10);
+        pulledDays[idx].attendanceStatus = e.target.value;
+      });
+    });
+
     const unmatchedEl = document.getElementById('attendance-unmatched');
-    if (unmatched.length) {
+    if (pulledUnmatched.length) {
       unmatchedEl.classList.remove('hidden');
-      unmatchedEl.innerHTML = 'Unmatched PulseTime emails (no employee record with this email): ' +
-        unmatched.map(u => `${u.email} (${u.totalHours}h)`).join(', ');
+      unmatchedEl.innerHTML = 'PulseTime entries found for emails with no matching employee record: ' + pulledUnmatched.join(', ');
     } else {
       unmatchedEl.classList.add('hidden');
     }
   }
 
   async function saveAttendanceSnapshot() {
-    if (!pulledSummary) return;
+    if (!pulledDays || !pulledDays.length) return;
     const periodId = document.getElementById('att-period-select').value;
+
+    const missingStatus = pulledDays.filter(r => r.isLeave && !r.attendanceStatus);
+    if (missingStatus.length) {
+      alert(`${missingStatus.length} leave day(s) still need an Attendance Status selected before saving.`);
+      return;
+    }
+
     const btn = document.getElementById('save-attendance-btn');
     btn.disabled = true;
     btn.textContent = 'Saving…';
-    const entries = Object.entries(pulledSummary).filter(([k]) => k !== '_unmatched');
-    for (const [empId, s] of entries) {
-      await setDoc(doc(db, 'attendance', `${periodId}_${empId}`), {
-        control_number: periodId,
+    for (const r of pulledDays) {
+      await setDoc(doc(db, 'attendance', `${periodId}_${r.employeeId}_${r.date}`), {
         period_id: periodId,
-        employee_id: empId,
-        days_present: s.daysPresent,
-        total_hours: s.totalHours,
-        ot_hours: s.otHours,
+        employee_id: r.employeeId,
+        date: r.date,
+        time_in: r.timeIn,
+        time_out: r.timeOut,
+        regular_hours: r.regularHours,
+        ot_hours: r.otHours,
+        late_minutes: r.lateMinutes,
+        undertime_minutes: r.undertimeMinutes,
+        is_leave: r.isLeave,
+        attendance_status: r.attendanceStatus || null,
         source: 'pulsetime',
         pulled_at: serverTimestamp()
       });
     }
     btn.disabled = false;
     btn.textContent = 'Save to payroll attendance';
-    alert('Attendance snapshot saved. Open this period in Payroll Processing to see it pre-filled.');
+    alert('Attendance saved — ' + pulledDays.length + ' day records. Open this period in Payroll Processing to see it pre-filled.');
   }
 
+  // Aggregates the saved daily records for one employee/period into the
+  // summary shape Payroll Processing pre-fills from (days present, OT, etc).
   async function getAttendanceSnapshot(periodId, employeeId) {
     try {
-      const snap = await getDoc(doc(db, 'attendance', `${periodId}_${employeeId}`));
-      return snap.exists() ? snap.data() : null;
+      const q = query(collection(db, 'attendance'), orderBy('date'));
+      const snap = await getDocs(q);
+      const days = [];
+      snap.forEach(d => {
+        const data = d.data();
+        if (data.period_id === periodId && data.employee_id === employeeId) days.push(data);
+      });
+      if (!days.length) return null;
+
+      let daysPresent = 0, totalHours = 0, otHours = 0, undertimeMinutes = 0;
+      days.forEach(d => {
+        if (!d.is_leave) {
+          daysPresent += 1;
+          totalHours += d.regular_hours || 0;
+          undertimeMinutes += d.undertime_minutes || 0;
+        } else if (d.attendance_status === 'PAID_LEAVE') {
+          daysPresent += 1; // paid leave still counts as a paid day
+        }
+        otHours += d.ot_hours || 0;
+      });
+      return {
+        days_present: daysPresent,
+        total_hours: Math.round(totalHours * 100) / 100,
+        ot_hours: Math.round(otHours * 100) / 100,
+        undertime_minutes: undertimeMinutes,
+        source: 'pulsetime'
+      };
     } catch { return null; }
   }
 
@@ -1624,12 +1731,18 @@
       </div>
 
       <div class="panel hidden" id="attendance-summary-wrap">
-        <h3>Pulled summary</h3>
-        <div class="panel-sub">Estimated OT is total hours beyond 8/day for the days present. Review before saving.</div>
+        <h3>Pulled daily records</h3>
+        <div class="panel-sub">One row per employee per calendar day in the cutoff. Days with zero PulseTime entries are auto-flagged as Leave — pick an Attendance Status for each before saving. Late isn't auto-calculated (no fixed shift start time); Undertime is based on hours short of 8 worked (after a 1hr unpaid lunch on sessions over an hour).</div>
+        <div style="overflow-x:auto;">
         <table>
-          <thead><tr><th>Employee</th><th class="num">Days present</th><th class="num">Total hours</th><th class="num">Est. OT hours</th></tr></thead>
+          <thead><tr>
+            <th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th>
+            <th class="num">Regular hrs</th><th class="num">OT hrs</th><th class="num">Undertime (min)</th>
+            <th>Leave</th><th style="min-width:140px;">Attendance Status</th>
+          </tr></thead>
           <tbody id="attendance-summary-tbody"></tbody>
         </table>
+        </div>
         <div id="attendance-unmatched" class="hidden" style="margin-top:14px; font-size:12.5px; color:var(--red);"></div>
         <div style="margin-top:18px;">
           <button class="btn-add" id="save-attendance-btn">Save to payroll attendance</button>
