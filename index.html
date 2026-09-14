@@ -171,6 +171,11 @@
     });
 
     document.getElementById('employee-form').addEventListener('submit', addEmployee);
+    document.getElementById('employee-cancel-btn').addEventListener('click', () => {
+      exitEditMode();
+      document.getElementById('employee-form').reset();
+      document.getElementById('rate-label').textContent = 'Daily rate (₱)';
+    });
     document.getElementById('period-form').addEventListener('submit', createPeriod);
     document.getElementById('save-batch-btn').addEventListener('click', saveBatch);
     document.getElementById('period-type-active').addEventListener('change', (e) => {
@@ -191,19 +196,56 @@
       department: document.getElementById('emp-department').value.trim(),
       rate_type: document.getElementById('rate-type').value,
       rate_amount: parseFloat(document.getElementById('rate-amount').value || 0),
-      status: 'active',
       date_hired: document.getElementById('emp-date-hired').value || null,
       sss_no: document.getElementById('emp-sss').value.trim(),
       philhealth_no: document.getElementById('emp-philhealth').value.trim(),
       pagibig_no: document.getElementById('emp-pagibig').value.trim(),
-      tin: document.getElementById('emp-tin').value.trim(),
-      created_at: serverTimestamp()
+      tin: document.getElementById('emp-tin').value.trim()
     };
     if (!emp.name) return;
-    await addDoc(collection(db, 'employees'), emp);
+
+    if (editingEmployeeId) {
+      await updateDoc(doc(db, 'employees', editingEmployeeId), emp);
+      exitEditMode();
+    } else {
+      emp.status = 'active';
+      emp.created_at = serverTimestamp();
+      await addDoc(collection(db, 'employees'), emp);
+    }
     e.target.reset();
     document.getElementById('rate-label').textContent = 'Daily rate (₱)';
   }
+
+  window.__mpEditEmployee = (id) => {
+    const emp = employeesCache.find(e => e.id === id);
+    if (!emp) return;
+    editingEmployeeId = id;
+    document.getElementById('emp-name').value = emp.name || '';
+    document.getElementById('emp-email').value = emp.email || '';
+    document.getElementById('emp-position').value = emp.position || '';
+    document.getElementById('emp-department').value = emp.department || '';
+    document.getElementById('rate-type').value = emp.rate_type || 'daily';
+    document.getElementById('rate-label').textContent = emp.rate_type === 'monthly' ? 'Monthly rate (₱)' : 'Daily rate (₱)';
+    document.getElementById('rate-amount').value = emp.rate_amount || '';
+    document.getElementById('emp-date-hired').value = emp.date_hired || '';
+    document.getElementById('emp-sss').value = emp.sss_no || '';
+    document.getElementById('emp-philhealth').value = emp.philhealth_no || '';
+    document.getElementById('emp-pagibig').value = emp.pagibig_no || '';
+    document.getElementById('emp-tin').value = emp.tin || '';
+
+    document.getElementById('employee-form-title').textContent = `Edit employee — ${emp.name}`;
+    document.getElementById('employee-submit-btn').textContent = 'Save changes';
+    document.getElementById('employee-cancel-btn').classList.remove('hidden');
+    document.getElementById('employee-form').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
+  function exitEditMode() {
+    editingEmployeeId = null;
+    document.getElementById('employee-form-title').textContent = 'Add employee';
+    document.getElementById('employee-submit-btn').textContent = 'Add employee';
+    document.getElementById('employee-cancel-btn').classList.add('hidden');
+  }
+
 
   function loadEmployees() {
     const q = query(collection(db, 'employees'), orderBy('name'));
@@ -222,7 +264,10 @@
             <td><span class="tag tag-${d.rate_type}">${d.rate_type}</span></td>
             <td class="num">₱${(d.rate_amount || 0).toLocaleString('en-PH', {minimumFractionDigits: 2})}</td>
             <td><span class="status status-${d.status}">${d.status}</span></td>
-            <td><button class="btn-icon" data-id="${docSnap.id}" onclick="__mpDeleteEmployee('${docSnap.id}')">Remove</button></td>
+            <td>
+              <button class="btn-icon" style="color:var(--navy);" onclick='__mpEditEmployee("${docSnap.id}")'>Edit</button>
+              <button class="btn-icon" style="margin-left:10px;" data-id="${docSnap.id}" onclick="__mpDeleteEmployee('${docSnap.id}')">Remove</button>
+            </td>
           </tr>`);
       });
       document.getElementById('employees-tbody').innerHTML = rows.join('') || `<tr><td colspan="7" class="empty">No employees yet. Add your first employee above.</td></tr>`;
@@ -329,6 +374,7 @@
   let currentPeriodId = null;
   let employeesCache = [];
   let periodsCache = [];
+  let editingEmployeeId = null;
 
   // ---------- Attendance (pulled from Mechatrade PulseTime) ----------
   let pulledSummary = null; // { [employeeId]: { name, email, daysPresent, totalHours, otHours } }, plus _unmatched[]
@@ -1010,7 +1056,7 @@
     <!-- Employees -->
     <section id="view-employees" class="view hidden">
       <div class="panel">
-        <h3>Add employee</h3>
+        <h3 id="employee-form-title">Add employee</h3>
         <div class="panel-sub">Set the rate type first — it determines how basic pay is computed.</div>
         <form id="employee-form">
           <div class="form-grid">
@@ -1062,7 +1108,8 @@
               <input type="text" id="emp-tin">
             </div>
           </div>
-          <button type="submit" class="btn-add">Add employee</button>
+          <button type="submit" class="btn-add" id="employee-submit-btn">Add employee</button>
+          <button type="button" class="btn-icon hidden" id="employee-cancel-btn" style="margin-left:14px;">Cancel edit</button>
         </form>
       </div>
 
