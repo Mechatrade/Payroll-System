@@ -325,6 +325,11 @@
     }
   };
 
+  // ---------- Shared state ----------
+  let currentPeriodId = null;
+  let employeesCache = [];
+  let periodsCache = [];
+
   // ---------- Attendance (pulled from Mechatrade PulseTime) ----------
   let pulledSummary = null; // { [employeeId]: { name, email, daysPresent, totalHours, otHours } }, plus _unmatched[]
 
@@ -458,8 +463,6 @@
     await updateDoc(ref, { control_number: ref.id });
     e.target.reset();
   }
-
-  let periodsCache = [];
 
   function loadPeriods() {
     const q = query(collection(db, 'payroll_periods'), orderBy('cutoff_start', 'desc'));
