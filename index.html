@@ -508,29 +508,66 @@
       `<option value="${s.value}" ${s.value === selected ? 'selected' : ''}>${s.label}</option>`).join('');
     const fmtTime = (iso) => iso ? new Date(iso).toLocaleString('en-PH', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—';
 
-    const rows = (pulledDays || []).map((r, idx) => `
-      <tr data-row-idx="${idx}">
-        <td>${r.employeeName}</td>
-        <td>${r.date}</td>
-        <td>${fmtTime(r.timeIn)}</td>
-        <td>${fmtTime(r.timeOut)}</td>
-        <td class="num">${r.regularHours}</td>
-        <td class="num">${r.otHours}</td>
-        <td class="num">${r.undertimeMinutes}</td>
-        <td>${r.isLeave ? '<span class="tag" style="border-color:var(--red); color:var(--red);">Leave</span>' : '—'}</td>
-        <td>
-          <select class="att-status-select" data-idx="${idx}" style="width:100%; padding:6px 8px; border:1px solid var(--line); background:${r.isLeave ? '#FFF8EC' : 'var(--paper)'}; font-family:inherit; font-size:12.5px;">
-            ${statusOptions(r.attendanceStatus)}
-          </select>
-        </td>
-      </tr>`).join('');
-    document.getElementById('attendance-summary-tbody').innerHTML = rows || `<tr><td colspan="9" class="empty">No active employees with an email on file, or no data for this cutoff.</td></tr>`;
+    const byEmployee = {}; // employeeId -> { name, rows: [{r, idx}] }
+    (pulledDays || []).forEach((r, idx) => {
+      if (!byEmployee[r.employeeId]) byEmployee[r.employeeId] = { name: r.employeeName, rows: [] };
+      byEmployee[r.employeeId].rows.push({ r, idx });
+    });
+
+    const groups = Object.entries(byEmployee).map(([empId, group]) => {
+      const leaveCount = group.rows.filter(x => x.r.isLeave).length;
+      const missingCount = group.rows.filter(x => x.r.isLeave && !x.r.attendanceStatus).length;
+      const otTotal = Math.round(group.rows.reduce((sum, x) => sum + (x.r.otHours || 0), 0) * 100) / 100;
+      const presentCount = group.rows.filter(x => !x.r.isLeave).length;
+
+      const detailRows = group.rows.map(({ r, idx }) => `
+        <tr class="att-detail-row" data-emp="${empId}" style="display:none;">
+          <td></td>
+          <td style="color:var(--muted);">${r.date}</td>
+          <td>${fmtTime(r.timeIn)}</td>
+          <td>${fmtTime(r.timeOut)}</td>
+          <td class="num">${r.regularHours}</td>
+          <td class="num">${r.otHours}</td>
+          <td class="num">${r.undertimeMinutes}</td>
+          <td>${r.isLeave ? '<span class="tag" style="border-color:var(--red); color:var(--red);">Leave</span>' : '—'}</td>
+          <td>
+            <select class="att-status-select" data-idx="${idx}" style="width:100%; padding:6px 8px; border:1px solid var(--line); background:${r.isLeave ? '#FFF8EC' : 'var(--paper)'}; font-family:inherit; font-size:12.5px;">
+              ${statusOptions(r.attendanceStatus)}
+            </select>
+          </td>
+        </tr>`).join('');
+
+      return `
+        <tr class="att-group-header" data-toggle="${empId}" style="cursor:pointer; background:var(--paper);">
+          <td colspan="2"><span class="att-chevron" data-chevron="${empId}" style="display:inline-block; width:12px;">▸</span> <strong>${group.name}</strong></td>
+          <td colspan="2" style="color:var(--muted); font-size:12px;">${presentCount} present-day rows · ${leaveCount} leave</td>
+          <td colspan="2" class="num" style="color:var(--muted); font-size:12px;">OT: ${otTotal}h</td>
+          <td colspan="3" style="color:${missingCount ? 'var(--red)' : 'var(--muted)'}; font-size:12px;">${missingCount ? missingCount + ' need a status' : 'All classified'}</td>
+        </tr>
+        ${detailRows}`;
+    }).join('');
+
+    document.getElementById('attendance-summary-tbody').innerHTML = groups || `<tr><td colspan="9" class="empty">No active employees with an email on file, or no data for this cutoff.</td></tr>`;
+
+    document.querySelectorAll('.att-group-header').forEach(header => {
+      header.addEventListener('click', () => {
+        const empId = header.dataset.toggle;
+        const chevron = document.querySelector(`[data-chevron="${empId}"]`);
+        const isOpen = chevron.textContent === '▾';
+        document.querySelectorAll(`.att-detail-row[data-emp="${empId}"]`).forEach(row => {
+          row.style.display = isOpen ? 'none' : 'table-row';
+        });
+        chevron.textContent = isOpen ? '▸' : '▾';
+      });
+    });
 
     document.querySelectorAll('.att-status-select').forEach(sel => {
       sel.addEventListener('change', (e) => {
         const idx = parseInt(e.target.dataset.idx, 10);
         pulledDays[idx].attendanceStatus = e.target.value;
+        e.stopPropagation();
       });
+      sel.addEventListener('click', (e) => e.stopPropagation());
     });
 
     const unmatchedEl = document.getElementById('attendance-unmatched');
