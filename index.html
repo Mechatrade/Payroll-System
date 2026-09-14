@@ -391,8 +391,9 @@
   // Business rules (confirmed): standard day = 8 worked hours + 1hr unpaid lunch,
   // no fixed clock-in time (so "Late" isn't auto-computed from raw punches —
   // it stays 0/manual unless corrected). A calendar day with zero PulseTime
-  // entries auto-flags as Leave and needs an Attendance Status picked before
-  // saving. Only PAID LEAVE counts as a paid day in payroll; UNPAID LEAVE,
+  // entries auto-flags as Leave and defaults to Unpaid Leave — override the
+  // dropdown per day if it was actually Paid Leave, Emergency Leave, etc.
+  // Only PAID LEAVE counts as a paid day in payroll; UNPAID LEAVE,
   // EMERGENCY LEAVE, and HALF DAY do not auto-count toward basic pay.
   const ATTENDANCE_STATUSES = [
     { value: '', label: '— select —' },
@@ -488,7 +489,7 @@
             rows.push({
               employeeId: emp.id, employeeName: emp.name, date: dateKey,
               timeIn: null, timeOut: null, regularHours: 0, otHours: 0,
-              lateMinutes: 0, undertimeMinutes: 0, isLeave: true, attendanceStatus: ''
+              lateMinutes: 0, undertimeMinutes: 0, isLeave: true, attendanceStatus: 'UNPAID_LEAVE'
             });
           }
         });
@@ -1778,7 +1779,7 @@
 
       <div class="panel hidden" id="attendance-summary-wrap">
         <h3>Pulled daily records</h3>
-        <div class="panel-sub">One row per employee per calendar day in the cutoff. Days with zero PulseTime entries are auto-flagged as Leave — pick an Attendance Status for each before saving. Late isn't auto-calculated (no fixed shift start time); Undertime is based on hours short of 8 worked (after a 1hr unpaid lunch on sessions over an hour).</div>
+        <div class="panel-sub">One row per employee per calendar day in the cutoff. Days with zero PulseTime entries auto-default to Unpaid Leave — change the dropdown per day if it was actually paid, emergency, or a half day. Late isn't auto-calculated (no fixed shift start time); Undertime is based on hours short of 8 worked (after a 1hr unpaid lunch on sessions over an hour).</div>
         <div style="overflow-x:auto;">
         <table>
           <thead><tr>
