@@ -405,7 +405,7 @@
     },
 
     // Full record for one employee in one payroll period.
-    // inputs (monthly-rate): { otHours, holidayPay, otherEarnings, unpaidAbsenceDays, unpaidLeaveDays, otherDeductions }
+    // inputs (monthly-rate): { otHours, holidayPay, otherEarnings, unpaidDays, otherDeductions }
     // inputs (daily-rate):   { otHours, holidayPay, otherEarnings, restDayPay, payableDays, otherDeductions }
     // taxPeriodFactor: 1 for a monthly cutoff, 0.5 for semi-monthly (tax withholding still splits evenly per cutoff — only SSS/PhilHealth/Pag-IBIG follow the first/second-cutoff rule).
     computeRecord(employee, inputs, period, taxPeriodFactor = 0.5, divisor = 26) {
@@ -414,14 +414,13 @@
       const otherEarnings = inputs.otherEarnings || 0;
       const otherDeductions = inputs.otherDeductions || 0;
 
-      let basic, gross, unpaidAbsenceDeduction = 0, unpaidLeaveDeduction = 0, restDayPay = 0;
+      let basic, gross, unpaidDeduction = 0, restDayPay = 0;
       if (employee.rate_type === 'monthly') {
         const semiMonthlyBase = employee.rate_amount / 2;
         const dailyEquivalent = employee.rate_amount / divisor;
-        unpaidAbsenceDeduction = (inputs.unpaidAbsenceDays || 0) * dailyEquivalent;
-        unpaidLeaveDeduction = (inputs.unpaidLeaveDays || 0) * dailyEquivalent;
+        unpaidDeduction = (inputs.unpaidDays || 0) * dailyEquivalent;
         basic = semiMonthlyBase;
-        gross = semiMonthlyBase - unpaidAbsenceDeduction - unpaidLeaveDeduction + ot + holidayPay + otherEarnings;
+        gross = semiMonthlyBase - unpaidDeduction + ot + holidayPay + otherEarnings;
       } else {
         restDayPay = inputs.restDayPay || 0;
         basic = employee.rate_amount * (inputs.payableDays || 0);
@@ -449,7 +448,7 @@
 
       return {
         basic, ot, holidayPay, restDayPay, otherEarnings,
-        unpaidAbsenceDeduction, unpaidLeaveDeduction,
+        unpaidDeduction,
         gross, sss, sssEmployer, sssEC, philhealth, philhealthEmployer, pagibig, pagibigEmployer, tax,
         otherDeductions, totalDeductions, net,
         contributionMonth: this.contributionMonth(period), cutoffPosition
@@ -707,15 +706,16 @@
       if (!days.length) return null;
 
       // daysPresent: used directly as "Payable Days" for daily-rate employees.
-      // unpaidAbsenceDays: worked days that fell short (auto-tagged Half Day) — present, but incomplete.
-      // unpaidLeaveDays: official leave days not marked Paid Leave (Unpaid/Emergency = 1 day, Half Day leave = 0.5).
-      let daysPresent = 0, paidLeaveDays = 0, unpaidAbsenceDays = 0, unpaidLeaveDays = 0;
+      // unpaidDays: any day that isn't fully paid — a worked-but-short day (Half Day),
+      // an official Unpaid/Emergency Leave day, or a Half Day leave. All treated the
+      // same way for pay purposes: they reduce the paid days for the period.
+      let daysPresent = 0, paidLeaveDays = 0, unpaidDays = 0;
       let totalHours = 0, otHours = 0, undertimeMinutes = 0;
       days.forEach(d => {
         if (!d.is_leave) {
           if (d.attendance_status === 'HALF_DAY') {
             daysPresent += 0.5;
-            unpaidAbsenceDays += 0.5; // present, but only worked half — attendance shortfall, not official leave
+            unpaidDays += 0.5; // present, but only worked half — counts as an unpaid half day
           } else {
             daysPresent += 1;
           }
@@ -725,17 +725,16 @@
           daysPresent += 1; // only Paid Leave counts as a paid day, per confirmed rule
           paidLeaveDays += 1;
         } else if (d.attendance_status === 'HALF_DAY') {
-          unpaidLeaveDays += 0.5; // took half a day of (unpaid) leave
+          unpaidDays += 0.5; // took half a day of (unpaid) leave
         } else {
-          unpaidLeaveDays += 1; // Unpaid Leave or Emergency Leave — full unpaid day
+          unpaidDays += 1; // Unpaid Leave or Emergency Leave — full unpaid day
         }
         otHours += d.ot_hours || 0;
       });
       return {
         days_present: daysPresent,
         paid_leave_days: paidLeaveDays,
-        unpaid_absence_days: Math.round(unpaidAbsenceDays * 100) / 100,
-        unpaid_leave_days: Math.round(unpaidLeaveDays * 100) / 100,
+        unpaid_days: Math.round(unpaidDays * 100) / 100,
         total_hours: Math.round(totalHours * 100) / 100,
         ot_hours: Math.round(otHours * 100) / 100,
         undertime_minutes: undertimeMinutes,
@@ -820,14 +819,12 @@
 
     const monthlyRows = activeEmployees.filter(e => e.rate_type === 'monthly').map(emp => {
       const snap = snapshots[emp.id];
-      const unpaidAbsence = snap ? snap.unpaid_absence_days : 0;
-      const unpaidLeave = snap ? snap.unpaid_leave_days : 0;
+      const unpaidDays = snap ? snap.unpaid_days : 0;
       const ot = snap ? snap.ot_hours : 0;
       return `
         <tr data-emp-id="${emp.id}" data-rate-type="monthly">
           <td>${emp.name}<div style="font-size:11px;color:var(--muted);">₱${emp.rate_amount}/mo${snap ? ' · from PulseTime' : ''}</div></td>
-          <td><input type="number" class="cell-input" data-field="unpaidAbsenceDays" value="${unpaidAbsence}" min="0" step="0.5" style="width:56px;"></td>
-          <td><input type="number" class="cell-input" data-field="unpaidLeaveDays" value="${unpaidLeave}" min="0" step="0.5" style="width:56px;"></td>
+          <td><input type="number" class="cell-input" data-field="unpaidDays" value="${unpaidDays}" min="0" step="0.5" style="width:56px;"></td>
           <td><input type="number" class="cell-input" data-field="otHours" value="${ot}" min="0" step="0.5" style="width:56px;"></td>
           <td><input type="number" class="cell-input" data-field="holidayPay" value="0" min="0" step="0.01" style="width:70px;"></td>
           <td><input type="number" class="cell-input" data-field="otherEarnings" value="0" min="0" step="0.01" style="width:70px;"></td>
@@ -872,7 +869,7 @@
 
     const inputs = emp.rate_type === 'monthly'
       ? {
-          unpaidAbsenceDays: val('unpaidAbsenceDays'), unpaidLeaveDays: val('unpaidLeaveDays'),
+          unpaidDays: val('unpaidDays'),
           otHours: val('otHours'), holidayPay: val('holidayPay'), otherEarnings: val('otherEarnings')
         }
       : {
@@ -1061,11 +1058,8 @@
           line('Other earnings', rec.otherEarnings)
         ].join('');
 
-    const absenceLeaveRows = emp.rate_type === 'monthly'
-      ? [
-          (rec.unpaidAbsenceDeduction ? line('Unpaid absence deduction', rec.unpaidAbsenceDeduction, true) : ''),
-          (rec.unpaidLeaveDeduction ? line('Unpaid leave deduction', rec.unpaidLeaveDeduction, true) : '')
-        ].join('')
+    const unpaidRow = (emp.rate_type === 'monthly' && rec.unpaidDeduction)
+      ? line('Unpaid days deduction', rec.unpaidDeduction, true)
       : '';
 
     return `
@@ -1085,7 +1079,7 @@
         <thead><tr><th colspan="2" style="text-align:left;">Earnings</th></tr></thead>
         <tbody>
           ${earningsRows}
-          ${absenceLeaveRows}
+          ${unpaidRow}
         </tbody>
         <tfoot><tr><td>Gross pay</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace;">₱${f(rec.gross)}</td></tr></tfoot>
       </table>
@@ -2022,12 +2016,12 @@
         </div>
 
         <h3 style="font-size:14px; margin-top:24px; margin-bottom:2px;">Monthly-rate employees</h3>
-        <div class="panel-sub" style="margin-bottom:12px;">Semi-monthly Base = Monthly Salary ÷ 2, minus Unpaid Absence/Leave deductions, plus OT/Holiday/Other Earnings.</div>
+        <div class="panel-sub" style="margin-bottom:12px;">Semi-monthly Base = Monthly Salary ÷ 2, minus Unpaid Days deduction, plus OT/Holiday/Other Earnings.</div>
         <div style="overflow-x:auto;">
         <table>
           <thead>
             <tr>
-              <th>Employee</th><th>Unpaid absence days</th><th>Unpaid leave days</th><th>OT hours</th>
+              <th>Employee</th><th>Unpaid days</th><th>OT hours</th>
               <th>Holiday pay (₱)</th><th>Other earnings (₱)</th>
               <th class="num">Gross</th><th class="num">Deductions</th><th class="num">Net pay</th>
             </tr>
