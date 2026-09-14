@@ -326,10 +326,6 @@
       if (employee.rate_type === 'daily') return employee.rate_amount;
       return employee.rate_amount / divisor;
     },
-    basicPay(employee, daysPresent, divisor = 26) {
-      if (employee.rate_type === 'daily') return employee.rate_amount * daysPresent;
-      return this.getDailyRateEquivalent(employee, divisor) * daysPresent;
-    },
     overtimePay(employee, otHours, divisor = 26, hoursPerDay = 8, otMultiplier = 1.25) {
       const hourlyRate = this.getDailyRateEquivalent(employee, divisor) / hoursPerDay;
       return hourlyRate * otHours * otMultiplier;
@@ -340,21 +336,58 @@
       if (employee.rate_type === 'monthly') return employee.rate_amount;
       return employee.rate_amount * workingDaysPerMonth;
     },
+
+    // ---- Statutory engine: Contribution Month → Monthly Compensation → SSS MSC → SSS/PhilHealth/Pag-IBIG → Employee/Employer shares ----
+    contributionMonth(period) {
+      return period.cutoff_start ? period.cutoff_start.slice(0, 7) : null; // 'YYYY-MM'
+    },
+    // A semi-monthly period is either the FIRST or SECOND cutoff of its month
+    // (day 1-15 = first, 16+ = second), determined by the cutoff's start date.
+    // A monthly period_type has only one cutoff, so it's always 'full'.
+    determineCutoffPosition(period) {
+      if (period.period_type === 'monthly') return 'full';
+      const day = new Date(period.cutoff_start + 'T00:00:00').getDate();
+      return day <= 15 ? 'first' : 'second';
+    },
+    // Confirmed rule: employee statutory deduction is 0 on the first cutoff
+    // of the month, and the FULL monthly amount on the second cutoff.
+    statutoryCutoffMultiplier(period) {
+      const position = this.determineCutoffPosition(period);
+      return position === 'first' ? 0 : 1;
+    },
+    sssMSC(monthlyComp) {
+      const t = STATUTORY_2026.sss;
+      return Math.min(Math.max(Math.ceil(monthlyComp / t.mscStep) * t.mscStep, t.mscFloor), t.mscCeiling);
+    },
     sssEmployeeShare(monthlyComp) {
       const t = STATUTORY_2026.sss;
-      const msc = Math.min(Math.max(Math.ceil(monthlyComp / t.mscStep) * t.mscStep, t.mscFloor), t.mscCeiling);
-      return Math.round(msc * t.employeeShare * 100) / 100;
+      return Math.round(this.sssMSC(monthlyComp) * t.employeeShare * 100) / 100;
+    },
+    sssEmployerShare(monthlyComp) {
+      const t = STATUTORY_2026.sss;
+      return Math.round(this.sssMSC(monthlyComp) * (t.rateTotal - t.employeeShare) * 100) / 100;
     },
     philhealthEmployeeShare(monthlyComp) {
       const t = STATUTORY_2026.philhealth;
       const base = Math.min(Math.max(monthlyComp, t.floor), t.ceiling);
       return Math.round(base * t.employeeShare * 100) / 100;
     },
+    philhealthEmployerShare(monthlyComp) {
+      const t = STATUTORY_2026.philhealth;
+      const base = Math.min(Math.max(monthlyComp, t.floor), t.ceiling);
+      return Math.round(base * (t.rateTotal - t.employeeShare) * 100) / 100;
+    },
     pagibigEmployeeShare(monthlyComp) {
       const t = STATUTORY_2026.pagibig;
       const base = Math.min(monthlyComp, t.mfsCap);
       const rate = monthlyComp <= t.lowThreshold ? t.rateLow : t.rateStandard;
       return Math.round(base * rate * 100) / 100;
+    },
+    pagibigEmployerShare(monthlyComp) {
+      // Employer matches the standard 2% rate regardless of the employee's low-income rate.
+      const t = STATUTORY_2026.pagibig;
+      const base = Math.min(monthlyComp, t.mfsCap);
+      return Math.round(base * t.rateStandard * 100) / 100;
     },
     withholdingTax(monthlyTaxableIncome) {
       const brackets = STATUTORY_2026.taxMonthly;
@@ -363,21 +396,56 @@
       const tax = bracket.base + (monthlyTaxableIncome - bracket.floor) * bracket.rate;
       return Math.round(Math.max(tax, 0) * 100) / 100;
     },
+
     // Full record for one employee in one payroll period.
-    // periodFactor: 1 for monthly cutoff, 0.5 for semi-monthly (statutory bases are halved per cutoff).
-    computeRecord(employee, { daysPresent, otHours, allowances = 0, otherDeductions = 0 }, periodFactor = 0.5, divisor = 26) {
-      const basic = this.basicPay(employee, daysPresent, divisor);
-      const ot = this.overtimePay(employee, otHours, divisor);
-      const gross = basic + ot + allowances;
+    // inputs (monthly-rate): { otHours, holidayPay, otherEarnings, unpaidAbsenceDays, unpaidLeaveDays, otherDeductions }
+    // inputs (daily-rate):   { otHours, holidayPay, otherEarnings, restDayPay, payableDays, otherDeductions }
+    // taxPeriodFactor: 1 for a monthly cutoff, 0.5 for semi-monthly (tax withholding still splits evenly per cutoff — only SSS/PhilHealth/Pag-IBIG follow the first/second-cutoff rule).
+    computeRecord(employee, inputs, period, taxPeriodFactor = 0.5, divisor = 26) {
+      const ot = this.overtimePay(employee, inputs.otHours || 0, divisor);
+      const holidayPay = inputs.holidayPay || 0;
+      const otherEarnings = inputs.otherEarnings || 0;
+      const otherDeductions = inputs.otherDeductions || 0;
+
+      let basic, gross, unpaidAbsenceDeduction = 0, unpaidLeaveDeduction = 0, restDayPay = 0;
+      if (employee.rate_type === 'monthly') {
+        const semiMonthlyBase = employee.rate_amount / 2;
+        const dailyEquivalent = employee.rate_amount / divisor;
+        unpaidAbsenceDeduction = (inputs.unpaidAbsenceDays || 0) * dailyEquivalent;
+        unpaidLeaveDeduction = (inputs.unpaidLeaveDays || 0) * dailyEquivalent;
+        basic = semiMonthlyBase;
+        gross = semiMonthlyBase - unpaidAbsenceDeduction - unpaidLeaveDeduction + ot + holidayPay + otherEarnings;
+      } else {
+        restDayPay = inputs.restDayPay || 0;
+        basic = employee.rate_amount * (inputs.payableDays || 0);
+        gross = basic + ot + holidayPay + restDayPay + otherEarnings;
+      }
+
       const monthlyComp = this.monthlyEquivalent(employee, divisor);
-      const sss = this.sssEmployeeShare(monthlyComp) * periodFactor;
-      const philhealth = this.philhealthEmployeeShare(monthlyComp) * periodFactor;
-      const pagibig = this.pagibigEmployeeShare(monthlyComp) * periodFactor;
-      const taxableIncome = Math.max(monthlyComp - (sss + philhealth + pagibig) / periodFactor, 0);
-      const tax = this.withholdingTax(taxableIncome) * periodFactor;
+      const cutoffPosition = this.determineCutoffPosition(period);
+      const statutoryMultiplier = this.statutoryCutoffMultiplier(period);
+
+      const sss = this.sssEmployeeShare(monthlyComp) * statutoryMultiplier;
+      const sssEmployer = this.sssEmployerShare(monthlyComp) * statutoryMultiplier;
+      const philhealth = this.philhealthEmployeeShare(monthlyComp) * statutoryMultiplier;
+      const philhealthEmployer = this.philhealthEmployerShare(monthlyComp) * statutoryMultiplier;
+      const pagibig = this.pagibigEmployeeShare(monthlyComp) * statutoryMultiplier;
+      const pagibigEmployer = this.pagibigEmployerShare(monthlyComp) * statutoryMultiplier;
+
+      // Withholding tax keeps the existing per-cutoff split (unaffected by the new SSS/PhilHealth/Pag-IBIG timing rule).
+      const taxableIncome = Math.max(monthlyComp - (this.sssEmployeeShare(monthlyComp) + this.philhealthEmployeeShare(monthlyComp) + this.pagibigEmployeeShare(monthlyComp)), 0);
+      const tax = this.withholdingTax(taxableIncome) * taxPeriodFactor;
+
       const totalDeductions = sss + philhealth + pagibig + tax + otherDeductions;
       const net = gross - totalDeductions;
-      return { basic, ot, allowances, gross, sss, philhealth, pagibig, tax, otherDeductions, totalDeductions, net };
+
+      return {
+        basic, ot, holidayPay, restDayPay, otherEarnings,
+        unpaidAbsenceDeduction, unpaidLeaveDeduction,
+        gross, sss, sssEmployer, philhealth, philhealthEmployer, pagibig, pagibigEmployer, tax,
+        otherDeductions, totalDeductions, net,
+        contributionMonth: this.contributionMonth(period), cutoffPosition
+      };
     }
   };
 
@@ -630,20 +698,36 @@
       snap.forEach(d => days.push(d.data()));
       if (!days.length) return null;
 
-      let daysPresent = 0, totalHours = 0, otHours = 0, undertimeMinutes = 0;
+      // daysPresent: used directly as "Payable Days" for daily-rate employees.
+      // unpaidAbsenceDays: worked days that fell short (auto-tagged Half Day) — present, but incomplete.
+      // unpaidLeaveDays: official leave days not marked Paid Leave (Unpaid/Emergency = 1 day, Half Day leave = 0.5).
+      let daysPresent = 0, paidLeaveDays = 0, unpaidAbsenceDays = 0, unpaidLeaveDays = 0;
+      let totalHours = 0, otHours = 0, undertimeMinutes = 0;
       days.forEach(d => {
         if (!d.is_leave) {
-          // A worked day that only logged ~4 hours (auto-tagged Half Day) counts as half a paid day.
-          daysPresent += (d.attendance_status === 'HALF_DAY') ? 0.5 : 1;
+          if (d.attendance_status === 'HALF_DAY') {
+            daysPresent += 0.5;
+            unpaidAbsenceDays += 0.5; // present, but only worked half — attendance shortfall, not official leave
+          } else {
+            daysPresent += 1;
+          }
           totalHours += d.regular_hours || 0;
           undertimeMinutes += d.undertime_minutes || 0;
         } else if (d.attendance_status === 'PAID_LEAVE') {
           daysPresent += 1; // only Paid Leave counts as a paid day, per confirmed rule
+          paidLeaveDays += 1;
+        } else if (d.attendance_status === 'HALF_DAY') {
+          unpaidLeaveDays += 0.5; // took half a day of (unpaid) leave
+        } else {
+          unpaidLeaveDays += 1; // Unpaid Leave or Emergency Leave — full unpaid day
         }
         otHours += d.ot_hours || 0;
       });
       return {
         days_present: daysPresent,
+        paid_leave_days: paidLeaveDays,
+        unpaid_absence_days: Math.round(unpaidAbsenceDays * 100) / 100,
+        unpaid_leave_days: Math.round(unpaidLeaveDays * 100) / 100,
         total_hours: Math.round(totalHours * 100) / 100,
         ot_hours: Math.round(otHours * 100) / 100,
         undertime_minutes: undertimeMinutes,
@@ -707,7 +791,8 @@
 
   async function renderProcessingTable() {
     const periodType = document.getElementById('period-type-active').dataset.type || 'semi-monthly';
-    const factor = periodType === 'monthly' ? 1 : 0.5;
+    const taxFactor = periodType === 'monthly' ? 1 : 0.5;
+    const period = periodsCache.find(p => p.id === currentPeriodId);
     const activeEmployees = employeesCache.filter(e => e.status === 'active');
 
     const snapshots = {};
@@ -715,34 +800,79 @@
       snapshots[emp.id] = await getAttendanceSnapshot(currentPeriodId, emp.id);
     }));
 
-    const rows = activeEmployees.map(emp => {
+    // Show the current cutoff's statutory position so it's obvious why SSS/PhilHealth/Pag-IBIG might read ₱0.
+    const cutoffBadge = document.getElementById('cutoff-position-badge');
+    if (cutoffBadge && period) {
+      const position = window.__mpCalc.determineCutoffPosition(period);
+      const label = position === 'first' ? 'First cutoff — SSS/PhilHealth/Pag-IBIG deduction: ₱0'
+        : position === 'second' ? 'Second cutoff — full month\'s SSS/PhilHealth/Pag-IBIG deducted here'
+        : 'Monthly cutoff — full statutory deduction';
+      cutoffBadge.textContent = label;
+    }
+
+    const monthlyRows = activeEmployees.filter(e => e.rate_type === 'monthly').map(emp => {
       const snap = snapshots[emp.id];
-      const days = snap ? snap.days_present : 13;
+      const unpaidAbsence = snap ? snap.unpaid_absence_days : 0;
+      const unpaidLeave = snap ? snap.unpaid_leave_days : 0;
       const ot = snap ? snap.ot_hours : 0;
       return `
-        <tr data-emp-id="${emp.id}">
-          <td>${emp.name}<div style="font-size:11px;color:var(--muted);">${emp.rate_type === 'daily' ? '₱' + emp.rate_amount + '/day' : '₱' + emp.rate_amount + '/mo'}${snap ? ' · from PulseTime' : ''}</div></td>
-          <td><input type="number" class="cell-input" data-field="days" value="${days}" min="0" step="0.5" style="width:60px;"></td>
-          <td><input type="number" class="cell-input" data-field="ot" value="${ot}" min="0" step="0.5" style="width:60px;"></td>
-          <td><input type="number" class="cell-input" data-field="allowances" value="0" min="0" step="0.01" style="width:70px;"></td>
+        <tr data-emp-id="${emp.id}" data-rate-type="monthly">
+          <td>${emp.name}<div style="font-size:11px;color:var(--muted);">₱${emp.rate_amount}/mo${snap ? ' · from PulseTime' : ''}</div></td>
+          <td><input type="number" class="cell-input" data-field="unpaidAbsenceDays" value="${unpaidAbsence}" min="0" step="0.5" style="width:56px;"></td>
+          <td><input type="number" class="cell-input" data-field="unpaidLeaveDays" value="${unpaidLeave}" min="0" step="0.5" style="width:56px;"></td>
+          <td><input type="number" class="cell-input" data-field="otHours" value="${ot}" min="0" step="0.5" style="width:56px;"></td>
+          <td><input type="number" class="cell-input" data-field="holidayPay" value="0" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="otherEarnings" value="0" min="0" step="0.01" style="width:70px;"></td>
           <td class="num result-gross">—</td>
           <td class="num result-deductions">—</td>
           <td class="num result-net">—</td>
         </tr>`;
     }).join('');
-    document.getElementById('processing-tbody').innerHTML = rows || `<tr><td colspan="7" class="empty">No active employees. Add employees first.</td></tr>`;
-    document.querySelectorAll('#processing-tbody .cell-input').forEach(inp => inp.addEventListener('input', () => recomputeRow(inp.closest('tr'), factor)));
-    document.querySelectorAll('#processing-tbody tr[data-emp-id]').forEach(tr => recomputeRow(tr, factor));
+
+    const dailyRows = activeEmployees.filter(e => e.rate_type === 'daily').map(emp => {
+      const snap = snapshots[emp.id];
+      const days = snap ? snap.days_present : 13;
+      const ot = snap ? snap.ot_hours : 0;
+      return `
+        <tr data-emp-id="${emp.id}" data-rate-type="daily">
+          <td>${emp.name}<div style="font-size:11px;color:var(--muted);">₱${emp.rate_amount}/day${snap ? ' · from PulseTime' : ''}</div></td>
+          <td><input type="number" class="cell-input" data-field="payableDays" value="${days}" min="0" step="0.5" style="width:56px;"></td>
+          <td><input type="number" class="cell-input" data-field="otHours" value="${ot}" min="0" step="0.5" style="width:56px;"></td>
+          <td><input type="number" class="cell-input" data-field="holidayPay" value="0" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="restDayPay" value="0" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="otherEarnings" value="0" min="0" step="0.01" style="width:70px;"></td>
+          <td class="num result-gross">—</td>
+          <td class="num result-deductions">—</td>
+          <td class="num result-net">—</td>
+        </tr>`;
+    }).join('');
+
+    document.getElementById('processing-tbody-monthly').innerHTML = monthlyRows || `<tr><td colspan="9" class="empty">No active monthly-rate employees.</td></tr>`;
+    document.getElementById('processing-tbody-daily').innerHTML = dailyRows || `<tr><td colspan="9" class="empty">No active daily-rate employees.</td></tr>`;
+
+    document.querySelectorAll('#processing-tbody-monthly .cell-input, #processing-tbody-daily .cell-input')
+      .forEach(inp => inp.addEventListener('input', () => recomputeRow(inp.closest('tr'), period, taxFactor)));
+    document.querySelectorAll('#processing-tbody-monthly tr[data-emp-id], #processing-tbody-daily tr[data-emp-id]')
+      .forEach(tr => recomputeRow(tr, period, taxFactor));
   }
 
-  function recomputeRow(tr, factor) {
+  function recomputeRow(tr, period, taxFactor) {
     const empId = tr.dataset.empId;
     const emp = employeesCache.find(e => e.id === empId);
-    if (!emp) return;
-    const days = parseFloat(tr.querySelector('[data-field="days"]').value || 0);
-    const ot = parseFloat(tr.querySelector('[data-field="ot"]').value || 0);
-    const allowances = parseFloat(tr.querySelector('[data-field="allowances"]').value || 0);
-    const rec = window.__mpCalc.computeRecord(emp, { daysPresent: days, otHours: ot, allowances }, factor);
+    if (!emp || !period) return;
+    const val = (field) => parseFloat(tr.querySelector(`[data-field="${field}"]`)?.value || 0);
+
+    const inputs = emp.rate_type === 'monthly'
+      ? {
+          unpaidAbsenceDays: val('unpaidAbsenceDays'), unpaidLeaveDays: val('unpaidLeaveDays'),
+          otHours: val('otHours'), holidayPay: val('holidayPay'), otherEarnings: val('otherEarnings')
+        }
+      : {
+          payableDays: val('payableDays'), otHours: val('otHours'),
+          holidayPay: val('holidayPay'), restDayPay: val('restDayPay'), otherEarnings: val('otherEarnings')
+        };
+
+    const rec = window.__mpCalc.computeRecord(emp, inputs, period, taxFactor);
     tr.querySelector('.result-gross').textContent = '₱' + rec.gross.toLocaleString('en-PH', {minimumFractionDigits: 2});
     tr.querySelector('.result-deductions').textContent = '₱' + rec.totalDeductions.toLocaleString('en-PH', {minimumFractionDigits: 2});
     tr.querySelector('.result-net').textContent = '₱' + rec.net.toLocaleString('en-PH', {minimumFractionDigits: 2});
@@ -752,7 +882,7 @@
   // ---------- Payroll sheet preview / print / email ----------
   function buildPayrollSheetHtml() {
     const period = periodsCache.find(p => p.id === currentPeriodId);
-    const rows = document.querySelectorAll('#processing-tbody tr[data-emp-id]');
+    const rows = document.querySelectorAll('#processing-tbody-monthly tr[data-emp-id], #processing-tbody-daily tr[data-emp-id]');
     if (!period || !rows.length) return null;
 
     const logoImg = document.querySelector('.login-logo');
@@ -842,7 +972,7 @@
     const logoSrc = logoImg ? logoImg.src : '';
     const f = (n) => (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
 
-    let totals = { gross: 0, sss: 0, philhealth: 0, pagibig: 0, tax: 0, deductions: 0, net: 0 };
+    let totals = { gross: 0, sss: 0, philhealth: 0, pagibig: 0, tax: 0, deductions: 0, net: 0, sssEmployer: 0, philhealthEmployer: 0, pagibigEmployer: 0 };
     const lineRows = records.map(rec => {
       const emp = employeesCache.find(e => e.id === rec.employee_id);
       totals.gross += rec.gross || 0;
@@ -852,6 +982,9 @@
       totals.tax += rec.tax || 0;
       totals.deductions += rec.totalDeductions || 0;
       totals.net += rec.net || 0;
+      totals.sssEmployer += rec.sssEmployer || 0;
+      totals.philhealthEmployer += rec.philhealthEmployer || 0;
+      totals.pagibigEmployer += rec.pagibigEmployer || 0;
       return `
         <tr>
           <td>${emp ? emp.name : rec.employee_id}</td>
@@ -904,6 +1037,28 @@
     const line = (label, value, negative) => `
       <tr><td>${label}</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace;">${negative ? '−' : ''}₱${f(value)}</td></tr>`;
 
+    const earningsRows = emp.rate_type === 'monthly'
+      ? [
+          line('Semi-monthly base (Monthly ÷ 2)', rec.basic),
+          line('Overtime pay', rec.ot),
+          line('Holiday pay', rec.holidayPay),
+          line('Other earnings', rec.otherEarnings)
+        ].join('')
+      : [
+          line('Basic pay (Daily rate × Payable days)', rec.basic),
+          line('Overtime pay', rec.ot),
+          line('Holiday pay', rec.holidayPay),
+          line('Rest day pay', rec.restDayPay),
+          line('Other earnings', rec.otherEarnings)
+        ].join('');
+
+    const absenceLeaveRows = emp.rate_type === 'monthly'
+      ? [
+          (rec.unpaidAbsenceDeduction ? line('Unpaid absence deduction', rec.unpaidAbsenceDeduction, true) : ''),
+          (rec.unpaidLeaveDeduction ? line('Unpaid leave deduction', rec.unpaidLeaveDeduction, true) : '')
+        ].join('')
+      : '';
+
     return `
       <div class="sheet-header">
         ${logoSrc ? `<img src="${logoSrc}" alt="Mechatrade">` : '<div></div>'}
@@ -920,14 +1075,13 @@
       <table class="sheet-table" style="max-width:420px;">
         <thead><tr><th colspan="2" style="text-align:left;">Earnings</th></tr></thead>
         <tbody>
-          ${line('Basic pay', rec.basic)}
-          ${line('Overtime pay', rec.ot)}
-          ${line('Allowances', rec.allowances)}
+          ${earningsRows}
+          ${absenceLeaveRows}
         </tbody>
         <tfoot><tr><td>Gross pay</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace;">₱${f(rec.gross)}</td></tr></tfoot>
       </table>
       <table class="sheet-table" style="max-width:420px; margin-top:18px;">
-        <thead><tr><th colspan="2" style="text-align:left;">Deductions</th></tr></thead>
+        <thead><tr><th colspan="2" style="text-align:left;">Deductions${rec.cutoffPosition === 'first' ? ' (first cutoff — no SSS/PhilHealth/Pag-IBIG)' : ''}</th></tr></thead>
         <tbody>
           ${line('SSS', rec.sss, true)}
           ${line('PhilHealth', rec.philhealth, true)}
@@ -939,6 +1093,14 @@
       </table>
       <table class="sheet-table" style="max-width:420px; margin-top:18px;">
         <tbody><tr style="font-weight:600;"><td>Net pay</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace; font-size:14px;">₱${f(rec.net)}</td></tr></tbody>
+      </table>
+      <table class="sheet-table" style="max-width:420px; margin-top:18px;">
+        <thead><tr><th colspan="2" style="text-align:left; font-size:11px; color:var(--muted);">Employer share (company cost, not deducted from employee)</th></tr></thead>
+        <tbody>
+          ${line('SSS (employer)', rec.sssEmployer)}
+          ${line('PhilHealth (employer)', rec.philhealthEmployer)}
+          ${line('Pag-IBIG (employer)', rec.pagibigEmployer)}
+        </tbody>
       </table>
       <div class="sheet-footer" style="margin-top:24px;">
         <div>Mechatrade Industrial Solutions Inc. — Payroll &amp; statutory system</div>
@@ -982,7 +1144,7 @@
 
   async function saveBatch() {
     if (!currentPeriodId) return;
-    const rows = document.querySelectorAll('#processing-tbody tr[data-emp-id]');
+    const rows = document.querySelectorAll('#processing-tbody-monthly tr[data-emp-id], #processing-tbody-daily tr[data-emp-id]');
     if (!rows.length) return;
     const saveBtn = document.getElementById('save-batch-btn');
     saveBtn.disabled = true;
@@ -1171,6 +1333,9 @@
       <div class="stat-cell"><div class="stat-label">Total PhilHealth (employee)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.philhealth)}</div></div>
       <div class="stat-cell"><div class="stat-label">Total Pag-IBIG (employee)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.pagibig)}</div></div>
       <div class="stat-cell"><div class="stat-label">Total withholding tax</div><div class="stat-value" style="font-size:17px;">${f(built.totals.tax)}</div></div>
+      <div class="stat-cell"><div class="stat-label">Total SSS (employer)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.sssEmployer)}</div></div>
+      <div class="stat-cell"><div class="stat-label">Total PhilHealth (employer)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.philhealthEmployer)}</div></div>
+      <div class="stat-cell"><div class="stat-label">Total Pag-IBIG (employer)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.pagibigEmployer)}</div></div>
     `;
     document.getElementById('report-register-content').innerHTML = built.html;
     wrap.classList.remove('hidden');
@@ -1837,21 +2002,44 @@
       <div class="panel hidden" id="processing-workspace">
         <h3>Process cutoff</h3>
         <div class="panel-sub">
-          Enter days present and OT hours per employee. Statutory basis:
+          Statutory basis:
           <select id="period-type-active" data-type="semi-monthly" style="border:1px solid var(--line); font-family:inherit; padding:4px 8px;">
-            <option value="semi-monthly" selected>Semi-monthly (half contributions per cutoff)</option>
-            <option value="monthly">Monthly (full contributions this cutoff)</option>
+            <option value="semi-monthly" selected>Semi-monthly (tax split per cutoff)</option>
+            <option value="monthly">Monthly (single cutoff)</option>
           </select>
+          <span id="cutoff-position-badge" style="margin-left:14px; font-size:12.5px; color:var(--gold); font-weight:500;"></span>
         </div>
+
+        <h3 style="font-size:14px; margin-top:24px; margin-bottom:2px;">Monthly-rate employees</h3>
+        <div class="panel-sub" style="margin-bottom:12px;">Semi-monthly Base = Monthly Salary ÷ 2, minus Unpaid Absence/Leave deductions, plus OT/Holiday/Other Earnings.</div>
+        <div style="overflow-x:auto;">
         <table>
           <thead>
             <tr>
-              <th>Employee</th><th>Days present</th><th>OT hours</th><th>Allowances (₱)</th>
+              <th>Employee</th><th>Unpaid absence days</th><th>Unpaid leave days</th><th>OT hours</th>
+              <th>Holiday pay (₱)</th><th>Other earnings (₱)</th>
               <th class="num">Gross</th><th class="num">Deductions</th><th class="num">Net pay</th>
             </tr>
           </thead>
-          <tbody id="processing-tbody"></tbody>
+          <tbody id="processing-tbody-monthly"></tbody>
         </table>
+        </div>
+
+        <h3 style="font-size:14px; margin-top:28px; margin-bottom:2px;">Daily-rate employees</h3>
+        <div class="panel-sub" style="margin-bottom:12px;">Basic Pay = Daily Rate × Payable Days, plus OT/Holiday/Rest Day/Other Earnings.</div>
+        <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Employee</th><th>Payable days</th><th>OT hours</th>
+              <th>Holiday pay (₱)</th><th>Rest day pay (₱)</th><th>Other earnings (₱)</th>
+              <th class="num">Gross</th><th class="num">Deductions</th><th class="num">Net pay</th>
+            </tr>
+          </thead>
+          <tbody id="processing-tbody-daily"></tbody>
+        </table>
+        </div>
+
         <div style="margin-top:18px;">
           <button class="btn-add" id="save-batch-btn">Save &amp; send for approval</button>
           <button class="btn-icon" id="preview-sheet-btn" style="margin-left:16px; color:var(--navy);">Preview payroll sheet</button>
