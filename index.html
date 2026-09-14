@@ -740,9 +740,9 @@
     const period = periodsCache.find(p => p.id === periodId);
     const emp = employeesCache.find(e => e.id === employeeId);
     if (!period || !emp) return null;
-    const snap = await getDoc(doc(db, 'payroll_records', `${periodId}_${employeeId}`));
-    if (!snap.exists()) return null;
-    const rec = snap.data();
+    const records = await fetchRecordsForPeriod(periodId);
+    const rec = records.find(r => r.employee_id === employeeId);
+    if (!rec) return null;
 
     const logoImg = document.querySelector('.login-logo');
     const logoSrc = logoImg ? logoImg.src : '';
@@ -931,6 +931,8 @@
   };
 
   window.__mpApprove = async (periodId) => {
+    const records = await fetchRecordsForPeriod(periodId);
+    if (!records.length) { alert('This period has no saved payroll records — process it first.'); return; }
     if (!confirm('Approve this payroll batch?')) return;
     await approvePeriod(periodId);
     __mpReviewPeriod(periodId);
@@ -943,6 +945,8 @@
   };
 
   window.__mpRelease = async (periodId) => {
+    const records = await fetchRecordsForPeriod(periodId);
+    if (!records.length) { alert('This period has no saved payroll records — nothing to release.'); return; }
     if (!confirm('Mark this batch as released (paid)? This should only be done once payment has actually gone out.')) return;
     await releasePeriod(periodId);
     __mpReviewPeriod(periodId);
