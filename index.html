@@ -184,6 +184,10 @@
     });
     document.getElementById('pull-pulsetime-btn').addEventListener('click', pullFromPulseTime);
     document.getElementById('save-attendance-btn').addEventListener('click', saveAttendanceSnapshot);
+    document.getElementById('preview-sheet-btn').addEventListener('click', openPayrollPreview);
+    document.getElementById('close-preview-btn').addEventListener('click', closePayrollPreview);
+    document.getElementById('print-sheet-btn').addEventListener('click', () => window.print());
+    document.getElementById('email-sheet-btn').addEventListener('click', emailPayrollSheet);
   });
 
   // ---------- Employees ----------
@@ -582,6 +586,115 @@
     tr.dataset.record = JSON.stringify(rec);
   }
 
+  // ---------- Payroll sheet preview / print / email ----------
+  function buildPayrollSheetHtml() {
+    const period = periodsCache.find(p => p.id === currentPeriodId);
+    const rows = document.querySelectorAll('#processing-tbody tr[data-emp-id]');
+    if (!period || !rows.length) return null;
+
+    const logoImg = document.querySelector('.login-logo');
+    const logoSrc = logoImg ? logoImg.src : '';
+
+    let totals = { gross: 0, sss: 0, philhealth: 0, pagibig: 0, tax: 0, deductions: 0, net: 0 };
+    const lineRows = Array.from(rows).map(tr => {
+      const empId = tr.dataset.empId;
+      const emp = employeesCache.find(e => e.id === empId);
+      const rec = JSON.parse(tr.dataset.record || '{}');
+      totals.gross += rec.gross || 0;
+      totals.sss += rec.sss || 0;
+      totals.philhealth += rec.philhealth || 0;
+      totals.pagibig += rec.pagibig || 0;
+      totals.tax += rec.tax || 0;
+      totals.deductions += rec.totalDeductions || 0;
+      totals.net += rec.net || 0;
+      const f = (n) => (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+      return `
+        <tr>
+          <td>${emp ? emp.name : '—'}</td>
+          <td>${f(rec.gross)}</td>
+          <td>${f(rec.sss)}</td>
+          <td>${f(rec.philhealth)}</td>
+          <td>${f(rec.pagibig)}</td>
+          <td>${f(rec.tax)}</td>
+          <td>${f(rec.totalDeductions)}</td>
+          <td>${f(rec.net)}</td>
+        </tr>`;
+    }).join('');
+    const f = (n) => (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+
+    return {
+      totals,
+      employeeCount: rows.length,
+      html: `
+        <div class="sheet-header">
+          ${logoSrc ? `<img src="${logoSrc}" alt="Mechatrade">` : '<div></div>'}
+          <div class="sheet-title">
+            <h2>Payroll Register</h2>
+            <div>Generated ${new Date().toLocaleString('en-PH')}</div>
+          </div>
+        </div>
+        <div class="sheet-meta">
+          <div><span>Cutoff period</span>${period.cutoff_start} – ${period.cutoff_end}</div>
+          <div><span>Pay date</span>${period.pay_date || '—'}</div>
+          <div><span>Period type</span>${period.period_type}</div>
+        </div>
+        <table class="sheet-table">
+          <thead>
+            <tr>
+              <th>Employee</th><th>Gross</th><th>SSS</th><th>PhilHealth</th><th>Pag-IBIG</th><th>Tax</th><th>Total ded.</th><th>Net pay</th>
+            </tr>
+          </thead>
+          <tbody>${lineRows}</tbody>
+          <tfoot>
+            <tr>
+              <td>Totals (${rows.length} employees)</td>
+              <td>${f(totals.gross)}</td>
+              <td>${f(totals.sss)}</td>
+              <td>${f(totals.philhealth)}</td>
+              <td>${f(totals.pagibig)}</td>
+              <td>${f(totals.tax)}</td>
+              <td>${f(totals.deductions)}</td>
+              <td>${f(totals.net)}</td>
+            </tr>
+          </tfoot>
+        </table>
+        <div class="sheet-footer">
+          <div>Mechatrade Industrial Solutions Inc. — Payroll &amp; statutory system</div>
+          <div>Control number: ${currentPeriodId}</div>
+        </div>`
+    };
+  }
+
+  function openPayrollPreview() {
+    const built = buildPayrollSheetHtml();
+    if (!built) { alert('Compute a payroll batch for this period first.'); return; }
+    document.getElementById('preview-sheet-content').innerHTML = built.html;
+    document.getElementById('payroll-preview').classList.remove('hidden');
+  }
+
+  function closePayrollPreview() {
+    document.getElementById('payroll-preview').classList.add('hidden');
+  }
+
+  function emailPayrollSheet() {
+    const built = buildPayrollSheetHtml();
+    if (!built) return;
+    const period = periodsCache.find(p => p.id === currentPeriodId);
+    const f = (n) => (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+    const subject = `Mechatrade Payroll Register — ${period.cutoff_start} to ${period.cutoff_end}`;
+    const body = [
+      `Payroll register for cutoff ${period.cutoff_start} to ${period.cutoff_end} (pay date: ${period.pay_date || '—'}).`,
+      ``,
+      `Employees: ${built.employeeCount}`,
+      `Total gross: ₱${f(built.totals.gross)}`,
+      `Total deductions: ₱${f(built.totals.deductions)}`,
+      `Total net pay: ₱${f(built.totals.net)}`,
+      ``,
+      `The full payroll sheet is attached as a PDF (use "Print / Save as PDF" on the preview screen, then attach the saved file here before sending).`
+    ].join('\n');
+    window.location.href = `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  }
+
   async function saveBatch() {
     if (!currentPeriodId) return;
     const rows = document.querySelectorAll('#processing-tbody tr[data-emp-id]');
@@ -925,6 +1038,64 @@
 
   .coming-soon h3 { color: var(--navy); margin-bottom: 8px; }
 
+  /* ---------- Payroll sheet preview / print ---------- */
+  .preview-overlay {
+    position: fixed;
+    inset: 0;
+    background: #E7EAEE;
+    z-index: 200;
+    overflow-y: auto;
+  }
+
+  .preview-toolbar {
+    position: sticky;
+    top: 0;
+    background: var(--navy);
+    padding: 14px 28px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    z-index: 2;
+  }
+
+  .preview-toolbar-title { color: #fff; font-family: 'IBM Plex Serif', serif; font-size: 15px; }
+  .preview-toolbar-actions { display: flex; align-items: center; gap: 4px; }
+  .preview-toolbar-actions .btn-icon { color: #DCE4EF; }
+  .preview-toolbar-actions .btn-icon:hover { color: #fff; }
+
+  .preview-sheet {
+    max-width: 900px;
+    margin: 28px auto 60px;
+    background: #fff;
+    padding: 48px;
+    border: 1px solid var(--line);
+  }
+
+  .sheet-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 28px; padding-bottom: 20px; border-bottom: 2px solid var(--navy); }
+  .sheet-header img { height: 52px; }
+  .sheet-header .sheet-title { text-align: right; }
+  .sheet-header .sheet-title h2 { font-size: 19px; color: var(--navy); }
+  .sheet-header .sheet-title div { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+  .sheet-meta { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 24px; font-size: 12.5px; }
+  .sheet-meta div span { display: block; color: var(--muted); font-size: 11px; margin-bottom: 2px; }
+
+  .sheet-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .sheet-table th { text-align: right; background: var(--paper); padding: 7px 8px; border: 1px solid var(--line); font-weight: 500; color: var(--muted); }
+  .sheet-table th:first-child { text-align: left; }
+  .sheet-table td { padding: 7px 8px; border: 1px solid var(--line); text-align: right; font-family: 'IBM Plex Mono', monospace; }
+  .sheet-table td:first-child { text-align: left; font-family: 'IBM Plex Sans', sans-serif; }
+  .sheet-table tfoot td { font-weight: 600; background: var(--paper); }
+
+  .sheet-footer { margin-top: 28px; font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; }
+
+  @media print {
+    body * { visibility: hidden; }
+    .preview-sheet, .preview-sheet * { visibility: visible; }
+    .preview-sheet { position: absolute; top: 0; left: 0; width: 100%; margin: 0; border: none; padding: 24px; }
+    .no-print { display: none !important; }
+  }
+
   @media (max-width: 760px) {
     #app-shell { flex-direction: column; }
     .sidebar { width: 100%; display: flex; overflow-x: auto; padding: 0; }
@@ -1214,6 +1385,7 @@
         </table>
         <div style="margin-top:18px;">
           <button class="btn-add" id="save-batch-btn">Save &amp; send for approval</button>
+          <button class="btn-icon" id="preview-sheet-btn" style="margin-left:16px; color:var(--navy);">Preview payroll sheet</button>
         </div>
       </div>
     </section>
@@ -1227,6 +1399,19 @@
       <div class="coming-soon"><h3>Reports</h3>Payroll register and government remittance reports (SSS R3, PhilHealth, Pag-IBIG) — next module.</div>
     </section>
   </main>
+</div>
+
+<!-- ===================== PAYROLL SHEET PREVIEW ===================== -->
+<div id="payroll-preview" class="preview-overlay hidden">
+  <div class="preview-toolbar no-print">
+    <div class="preview-toolbar-title">Payroll register preview</div>
+    <div class="preview-toolbar-actions">
+      <button class="btn-add" id="print-sheet-btn">Print / Save as PDF</button>
+      <button class="btn-icon" id="email-sheet-btn" style="color:var(--navy);">Email summary</button>
+      <button class="btn-icon" id="close-preview-btn">Close</button>
+    </div>
+  </div>
+  <div class="preview-sheet" id="preview-sheet-content"></div>
 </div>
 
 </body>
