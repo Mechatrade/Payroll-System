@@ -396,6 +396,7 @@
   // EMERGENCY LEAVE, and HALF DAY do not auto-count toward basic pay.
   const ATTENDANCE_STATUSES = [
     { value: '', label: '— select —' },
+    { value: 'PRESENT', label: 'Present' },
     { value: 'PAID_LEAVE', label: 'Paid Leave' },
     { value: 'UNPAID_LEAVE', label: 'Unpaid Leave' },
     { value: 'EMERGENCY_LEAVE', label: 'Emergency Leave' },
@@ -466,6 +467,10 @@
             const regularMinutes = Math.min(workedMinutes, 8 * 60);
             const otMinutes = Math.max(workedMinutes - 8 * 60, 0);
             const undertimeMinutes = Math.max(8 * 60 - workedMinutes, 0);
+            // Auto-classify: ~4 worked hours reads as a half day; anything
+            // else with actual time in/out (including a full 8hrs) reads as
+            // Present. Admin can still override via the dropdown.
+            const autoStatus = (workedMinutes >= 180 && workedMinutes <= 300) ? 'HALF_DAY' : 'PRESENT';
             rows.push({
               employeeId: emp.id, employeeName: emp.name, date: dateKey,
               timeIn: entry.earliestStart.toISOString(), timeOut: entry.latestEnd.toISOString(),
@@ -473,7 +478,7 @@
               otHours: Math.round((otMinutes / 60) * 100) / 100,
               lateMinutes: 0,
               undertimeMinutes: Math.round(undertimeMinutes),
-              isLeave: false, attendanceStatus: ''
+              isLeave: false, attendanceStatus: autoStatus
             });
           } else {
             rows.push({
@@ -588,11 +593,12 @@
       let daysPresent = 0, totalHours = 0, otHours = 0, undertimeMinutes = 0;
       days.forEach(d => {
         if (!d.is_leave) {
-          daysPresent += 1;
+          // A worked day that only logged ~4 hours (auto-tagged Half Day) counts as half a paid day.
+          daysPresent += (d.attendance_status === 'HALF_DAY') ? 0.5 : 1;
           totalHours += d.regular_hours || 0;
           undertimeMinutes += d.undertime_minutes || 0;
         } else if (d.attendance_status === 'PAID_LEAVE') {
-          daysPresent += 1; // paid leave still counts as a paid day
+          daysPresent += 1; // only Paid Leave counts as a paid day, per confirmed rule
         }
         otHours += d.ot_hours || 0;
       });
