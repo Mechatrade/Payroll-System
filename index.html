@@ -188,6 +188,13 @@
     document.getElementById('close-preview-btn').addEventListener('click', closePayrollPreview);
     document.getElementById('print-sheet-btn').addEventListener('click', () => window.print());
     document.getElementById('email-sheet-btn').addEventListener('click', emailPayrollSheet);
+
+    document.getElementById('payslip-period-select').addEventListener('change', (e) => loadPayslipEmployees(e.target.value));
+    document.getElementById('view-payslip-btn').addEventListener('click', viewPayslip);
+    document.getElementById('print-payslip-btn').addEventListener('click', printPayslip);
+
+    document.getElementById('view-report-btn').addEventListener('click', viewReport);
+    document.getElementById('print-report-btn').addEventListener('click', printReport);
   });
 
   // ---------- Employees ----------
@@ -533,6 +540,9 @@
       });
       document.getElementById('periods-tbody').innerHTML = rows.join('') || `<tr><td colspan="5" class="empty">No payroll periods yet. Create one above.</td></tr>`;
       populateAttendancePeriodSelect();
+      renderApprovalList();
+      populatePayslipPeriodSelect();
+      populateReportPeriodSelect();
     });
   }
 
@@ -665,10 +675,132 @@
     };
   }
 
+  // Builds the same style of register as buildPayrollSheetHtml, but from saved
+  // Firestore records rather than the live Processing table — used by
+  // Approval, Payslips, and Reports, which may view a period that isn't
+  // currently open in Processing.
+  async function buildRegisterFromRecords(periodId) {
+    const period = periodsCache.find(p => p.id === periodId);
+    if (!period) return null;
+    const records = await fetchRecordsForPeriod(periodId);
+    if (!records.length) return null;
+
+    const logoImg = document.querySelector('.login-logo');
+    const logoSrc = logoImg ? logoImg.src : '';
+    const f = (n) => (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+
+    let totals = { gross: 0, sss: 0, philhealth: 0, pagibig: 0, tax: 0, deductions: 0, net: 0 };
+    const lineRows = records.map(rec => {
+      const emp = employeesCache.find(e => e.id === rec.employee_id);
+      totals.gross += rec.gross || 0;
+      totals.sss += rec.sss || 0;
+      totals.philhealth += rec.philhealth || 0;
+      totals.pagibig += rec.pagibig || 0;
+      totals.tax += rec.tax || 0;
+      totals.deductions += rec.totalDeductions || 0;
+      totals.net += rec.net || 0;
+      return `
+        <tr>
+          <td>${emp ? emp.name : rec.employee_id}</td>
+          <td>${f(rec.gross)}</td><td>${f(rec.sss)}</td><td>${f(rec.philhealth)}</td>
+          <td>${f(rec.pagibig)}</td><td>${f(rec.tax)}</td><td>${f(rec.totalDeductions)}</td><td>${f(rec.net)}</td>
+        </tr>`;
+    }).join('');
+
+    return {
+      totals,
+      employeeCount: records.length,
+      html: `
+        <div class="sheet-header">
+          ${logoSrc ? `<img src="${logoSrc}" alt="Mechatrade">` : '<div></div>'}
+          <div class="sheet-title"><h2>Payroll Register</h2><div>Generated ${new Date().toLocaleString('en-PH')}</div></div>
+        </div>
+        <div class="sheet-meta">
+          <div><span>Cutoff period</span>${period.cutoff_start} – ${period.cutoff_end}</div>
+          <div><span>Pay date</span>${period.pay_date || '—'}</div>
+          <div><span>Status</span>${period.status}</div>
+        </div>
+        <table class="sheet-table">
+          <thead><tr><th>Employee</th><th>Gross</th><th>SSS</th><th>PhilHealth</th><th>Pag-IBIG</th><th>Tax</th><th>Total ded.</th><th>Net pay</th></tr></thead>
+          <tbody>${lineRows}</tbody>
+          <tfoot><tr>
+            <td>Totals (${records.length} employees)</td>
+            <td>${f(totals.gross)}</td><td>${f(totals.sss)}</td><td>${f(totals.philhealth)}</td>
+            <td>${f(totals.pagibig)}</td><td>${f(totals.tax)}</td><td>${f(totals.deductions)}</td><td>${f(totals.net)}</td>
+          </tr></tfoot>
+        </table>
+        <div class="sheet-footer">
+          <div>Mechatrade Industrial Solutions Inc. — Payroll &amp; statutory system</div>
+          <div>Control number: ${periodId}</div>
+        </div>`
+    };
+  }
+
+  async function buildIndividualPayslipHtml(periodId, employeeId) {
+    const period = periodsCache.find(p => p.id === periodId);
+    const emp = employeesCache.find(e => e.id === employeeId);
+    if (!period || !emp) return null;
+    const snap = await getDoc(doc(db, 'payroll_records', `${periodId}_${employeeId}`));
+    if (!snap.exists()) return null;
+    const rec = snap.data();
+
+    const logoImg = document.querySelector('.login-logo');
+    const logoSrc = logoImg ? logoImg.src : '';
+    const f = (n) => (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+
+    const line = (label, value, negative) => `
+      <tr><td>${label}</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace;">${negative ? '−' : ''}₱${f(value)}</td></tr>`;
+
+    return `
+      <div class="sheet-header">
+        ${logoSrc ? `<img src="${logoSrc}" alt="Mechatrade">` : '<div></div>'}
+        <div class="sheet-title"><h2>Payslip</h2><div>Generated ${new Date().toLocaleString('en-PH')}</div></div>
+      </div>
+      <div class="sheet-meta">
+        <div><span>Employee</span>${emp.name}</div>
+        <div><span>Position</span>${emp.position || '—'}</div>
+        <div><span>Rate type</span>${emp.rate_type}</div>
+        <div><span>Cutoff period</span>${period.cutoff_start} – ${period.cutoff_end}</div>
+        <div><span>Pay date</span>${period.pay_date || '—'}</div>
+        <div><span>Status</span>${rec.status}</div>
+      </div>
+      <table class="sheet-table" style="max-width:420px;">
+        <thead><tr><th colspan="2" style="text-align:left;">Earnings</th></tr></thead>
+        <tbody>
+          ${line('Basic pay', rec.basic)}
+          ${line('Overtime pay', rec.ot)}
+          ${line('Allowances', rec.allowances)}
+        </tbody>
+        <tfoot><tr><td>Gross pay</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace;">₱${f(rec.gross)}</td></tr></tfoot>
+      </table>
+      <table class="sheet-table" style="max-width:420px; margin-top:18px;">
+        <thead><tr><th colspan="2" style="text-align:left;">Deductions</th></tr></thead>
+        <tbody>
+          ${line('SSS', rec.sss, true)}
+          ${line('PhilHealth', rec.philhealth, true)}
+          ${line('Pag-IBIG', rec.pagibig, true)}
+          ${line('Withholding tax', rec.tax, true)}
+          ${line('Other deductions', rec.otherDeductions, true)}
+        </tbody>
+        <tfoot><tr><td>Total deductions</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace;">−₱${f(rec.totalDeductions)}</td></tr></tfoot>
+      </table>
+      <table class="sheet-table" style="max-width:420px; margin-top:18px;">
+        <tbody><tr style="font-weight:600;"><td>Net pay</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace; font-size:14px;">₱${f(rec.net)}</td></tr></tbody>
+      </table>
+      <div class="sheet-footer" style="margin-top:24px;">
+        <div>Mechatrade Industrial Solutions Inc. — Payroll &amp; statutory system</div>
+        <div>Control number: ${periodId}</div>
+      </div>`;
+  }
+
   function openPayrollPreview() {
     const built = buildPayrollSheetHtml();
     if (!built) { alert('Compute a payroll batch for this period first.'); return; }
-    document.getElementById('preview-sheet-content').innerHTML = built.html;
+    showPreview(built.html);
+  }
+
+  function showPreview(html) {
+    document.getElementById('preview-sheet-content').innerHTML = html;
     document.getElementById('payroll-preview').classList.remove('hidden');
   }
 
@@ -705,19 +837,192 @@
     for (const tr of rows) {
       const empId = tr.dataset.empId;
       const rec = JSON.parse(tr.dataset.record || '{}');
-      await addDoc(collection(db, 'payroll_records'), {
+      await setDoc(doc(db, 'payroll_records', `${currentPeriodId}_${empId}`), {
         control_number: currentPeriodId,
         period_id: currentPeriodId,
         employee_id: empId,
         ...rec,
-        status: 'draft',
-        created_at: serverTimestamp()
-      });
+        status: 'for_approval',
+        updated_at: serverTimestamp()
+      }, { merge: true });
     }
     await updateDoc(doc(db, 'payroll_periods', currentPeriodId), { status: 'for_approval' });
     saveBtn.disabled = false;
     saveBtn.textContent = 'Save & send for approval';
     alert('Payroll batch saved and marked for approval.');
+  }
+
+  async function fetchRecordsForPeriod(periodId) {
+    const q = query(collection(db, 'payroll_records'), orderBy('employee_id'));
+    const snap = await getDocs(q);
+    const records = [];
+    snap.forEach(d => { const data = d.data(); if (data.period_id === periodId) records.push({ id: d.id, ...data }); });
+    return records;
+  }
+
+  async function approvePeriod(periodId) {
+    const records = await fetchRecordsForPeriod(periodId);
+    for (const rec of records) {
+      await updateDoc(doc(db, 'payroll_records', rec.id), { status: 'approved' });
+    }
+    await updateDoc(doc(db, 'payroll_periods', periodId), { status: 'approved' });
+  }
+
+  async function sendPeriodBackToDraft(periodId) {
+    const records = await fetchRecordsForPeriod(periodId);
+    for (const rec of records) {
+      await updateDoc(doc(db, 'payroll_records', rec.id), { status: 'draft' });
+    }
+    await updateDoc(doc(db, 'payroll_periods', periodId), { status: 'draft' });
+  }
+
+  async function releasePeriod(periodId) {
+    const records = await fetchRecordsForPeriod(periodId);
+    for (const rec of records) {
+      await updateDoc(doc(db, 'payroll_records', rec.id), { status: 'released' });
+    }
+    await updateDoc(doc(db, 'payroll_periods', periodId), { status: 'released' });
+  }
+
+  // ---------- Approval ----------
+  function renderApprovalList() {
+    const tbody = document.getElementById('approval-periods-tbody');
+    if (!tbody) return;
+    const rows = periodsCache.filter(p => p.status !== 'draft').map(p => `
+      <tr>
+        <td>${p.cutoff_start} – ${p.cutoff_end}</td>
+        <td><span class="status status-${p.status === 'released' ? 'active' : 'inactive'}">${p.status}</span></td>
+        <td><button class="btn-icon" style="color:var(--navy);" onclick="__mpReviewPeriod('${p.id}')">Review</button></td>
+      </tr>`).join('');
+    tbody.innerHTML = rows || `<tr><td colspan="3" class="empty">No periods submitted for approval yet.</td></tr>`;
+  }
+
+  window.__mpReviewPeriod = async (periodId) => {
+    const built = await buildRegisterFromRecords(periodId);
+    const period = periodsCache.find(p => p.id === periodId);
+    const wrap = document.getElementById('approval-review-wrap');
+    wrap.classList.remove('hidden');
+    if (!built) {
+      document.getElementById('approval-review-content').innerHTML = '<div class="empty">No saved payroll records for this period.</div>';
+      document.getElementById('approval-actions').innerHTML = '';
+      return;
+    }
+    document.getElementById('approval-review-content').innerHTML = built.html;
+
+    let actionsHtml = `<button class="btn-icon" onclick="__mpPrintPeriod('${periodId}')" style="color:var(--navy);">Print / Save as PDF</button>`;
+    if (currentUserRole === 'admin') {
+      if (period.status === 'for_approval') {
+        actionsHtml += ` <button class="btn-add" style="margin-left:14px;" onclick="__mpApprove('${periodId}')">Approve batch</button>
+          <button class="btn-icon" style="margin-left:10px; color:var(--red);" onclick="__mpSendBack('${periodId}')">Send back to draft</button>`;
+      } else if (period.status === 'approved') {
+        actionsHtml += ` <button class="btn-add" style="margin-left:14px;" onclick="__mpRelease('${periodId}')">Mark as released (paid)</button>`;
+      } else if (period.status === 'released') {
+        actionsHtml += ` <span style="margin-left:14px; color:var(--muted); font-size:12.5px;">Released — no further action.</span>`;
+      }
+    } else {
+      actionsHtml += ` <span style="margin-left:14px; color:var(--muted); font-size:12.5px;">Admin approval required to change status.</span>`;
+    }
+    document.getElementById('approval-actions').innerHTML = actionsHtml;
+  };
+
+  window.__mpPrintPeriod = async (periodId) => {
+    const built = await buildRegisterFromRecords(periodId);
+    if (built) showPreview(built.html);
+  };
+
+  window.__mpApprove = async (periodId) => {
+    if (!confirm('Approve this payroll batch?')) return;
+    await approvePeriod(periodId);
+    __mpReviewPeriod(periodId);
+  };
+
+  window.__mpSendBack = async (periodId) => {
+    if (!confirm('Send this batch back to draft? It will need to be reprocessed and resubmitted.')) return;
+    await sendPeriodBackToDraft(periodId);
+    __mpReviewPeriod(periodId);
+  };
+
+  window.__mpRelease = async (periodId) => {
+    if (!confirm('Mark this batch as released (paid)? This should only be done once payment has actually gone out.')) return;
+    await releasePeriod(periodId);
+    __mpReviewPeriod(periodId);
+  };
+
+  // ---------- Payslips ----------
+  function populatePayslipPeriodSelect() {
+    const sel = document.getElementById('payslip-period-select');
+    if (!sel) return;
+    const eligible = periodsCache.filter(p => p.status !== 'draft');
+    sel.innerHTML = eligible.map(p => `<option value="${p.id}">${p.cutoff_start} – ${p.cutoff_end} (${p.status})</option>`).join('')
+      || '<option value="">No processed periods yet</option>';
+    if (eligible.length) loadPayslipEmployees(eligible[0].id);
+  }
+
+  async function loadPayslipEmployees(periodId) {
+    const sel = document.getElementById('payslip-employee-select');
+    if (!sel || !periodId) return;
+    const records = await fetchRecordsForPeriod(periodId);
+    sel.innerHTML = records.map(rec => {
+      const emp = employeesCache.find(e => e.id === rec.employee_id);
+      return `<option value="${rec.employee_id}">${emp ? emp.name : rec.employee_id}</option>`;
+    }).join('') || '<option value="">No records for this period</option>';
+  }
+
+  async function viewPayslip() {
+    const periodId = document.getElementById('payslip-period-select').value;
+    const employeeId = document.getElementById('payslip-employee-select').value;
+    if (!periodId || !employeeId) return;
+    const html = await buildIndividualPayslipHtml(periodId, employeeId);
+    if (!html) { alert('No payslip found for this employee in this period.'); return; }
+    document.getElementById('payslip-view-content').innerHTML = html;
+    document.getElementById('payslip-view-wrap').classList.remove('hidden');
+  }
+
+  async function printPayslip() {
+    const periodId = document.getElementById('payslip-period-select').value;
+    const employeeId = document.getElementById('payslip-employee-select').value;
+    if (!periodId || !employeeId) return;
+    const html = await buildIndividualPayslipHtml(periodId, employeeId);
+    if (!html) { alert('No payslip found for this employee in this period.'); return; }
+    showPreview(html);
+  }
+
+  // ---------- Reports ----------
+  function populateReportPeriodSelect() {
+    const sel = document.getElementById('report-period-select');
+    if (!sel) return;
+    const eligible = periodsCache.filter(p => p.status !== 'draft');
+    sel.innerHTML = eligible.map(p => `<option value="${p.id}">${p.cutoff_start} – ${p.cutoff_end} (${p.status})</option>`).join('')
+      || '<option value="">No processed periods yet</option>';
+  }
+
+  async function viewReport() {
+    const periodId = document.getElementById('report-period-select').value;
+    if (!periodId) return;
+    const built = await buildRegisterFromRecords(periodId);
+    const wrap = document.getElementById('report-wrap');
+    if (!built) {
+      wrap.classList.remove('hidden');
+      document.getElementById('report-stats').innerHTML = '';
+      document.getElementById('report-register-content').innerHTML = '<div class="empty">No saved payroll records for this period.</div>';
+      return;
+    }
+    const f = (n) => '₱' + (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+    document.getElementById('report-stats').innerHTML = `
+      <div class="stat-cell"><div class="stat-label">Total SSS (employee)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.sss)}</div></div>
+      <div class="stat-cell"><div class="stat-label">Total PhilHealth (employee)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.philhealth)}</div></div>
+      <div class="stat-cell"><div class="stat-label">Total Pag-IBIG (employee)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.pagibig)}</div></div>
+      <div class="stat-cell"><div class="stat-label">Total withholding tax</div><div class="stat-value" style="font-size:17px;">${f(built.totals.tax)}</div></div>
+    `;
+    document.getElementById('report-register-content').innerHTML = built.html;
+    wrap.classList.remove('hidden');
+  }
+
+  async function printReport() {
+    const periodId = document.getElementById('report-period-select').value;
+    if (!periodId) return;
+    const built = await buildRegisterFromRecords(periodId);
+    if (built) showPreview(built.html);
   }
 
   function loadEmployeesForProcessing() {
@@ -1390,13 +1695,64 @@
       </div>
     </section>
     <section id="view-approval" class="view hidden">
-      <div class="coming-soon"><h3>Approval</h3>Review and approve a payroll batch before release — next module.</div>
+      <div class="panel">
+        <h3>Periods awaiting or past approval</h3>
+        <div class="panel-sub">Only submitted batches (status: for approval, approved, or released) appear here. Approving requires an admin account.</div>
+        <table>
+          <thead><tr><th>Cutoff</th><th>Status</th><th></th></tr></thead>
+          <tbody id="approval-periods-tbody"><tr><td colspan="3" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+
+      <div class="panel hidden" id="approval-review-wrap">
+        <h3>Review</h3>
+        <div id="approval-review-content"></div>
+        <div id="approval-actions" style="margin-top:18px;"></div>
+      </div>
     </section>
     <section id="view-payslip" class="view hidden">
-      <div class="coming-soon"><h3>Payslips</h3>Individual payslip view and print — next module.</div>
+      <div class="panel">
+        <h3>View payslip</h3>
+        <div class="panel-sub">Pulls from saved, processed payroll records — only periods that have been through Payroll Processing appear here.</div>
+        <div class="form-grid" style="grid-template-columns: 2fr 2fr 1fr; align-items: end;">
+          <div class="field">
+            <label for="payslip-period-select">Payroll period</label>
+            <select id="payslip-period-select" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+          </div>
+          <div class="field">
+            <label for="payslip-employee-select">Employee</label>
+            <select id="payslip-employee-select" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+          </div>
+          <button type="button" class="btn-add" id="view-payslip-btn">View payslip</button>
+        </div>
+      </div>
+
+      <div class="panel hidden" id="payslip-view-wrap">
+        <h3>Payslip</h3>
+        <div id="payslip-view-content"></div>
+        <div style="margin-top:18px;">
+          <button class="btn-icon" id="print-payslip-btn" style="color:var(--navy);">Print / Save as PDF</button>
+        </div>
+      </div>
     </section>
     <section id="view-reports" class="view hidden">
-      <div class="coming-soon"><h3>Reports</h3>Payroll register and government remittance reports (SSS R3, PhilHealth, Pag-IBIG) — next module.</div>
+      <div class="panel">
+        <h3>Payroll register &amp; statutory summary</h3>
+        <div class="panel-sub">Select a processed period to see total government contributions and the full register. This is a summary view — always cross-check against the official SSS/PhilHealth/Pag-IBIG/BIR forms before remitting.</div>
+        <div class="form-grid" style="grid-template-columns: 2fr 1fr 1fr; align-items: end;">
+          <div class="field">
+            <label for="report-period-select">Payroll period</label>
+            <select id="report-period-select" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+          </div>
+          <button type="button" class="btn-add" id="view-report-btn">View report</button>
+          <button type="button" class="btn-icon" id="print-report-btn" style="color:var(--navy);">Print / Save as PDF</button>
+        </div>
+      </div>
+
+      <div class="panel hidden" id="report-wrap">
+        <div class="stat-grid" id="report-stats" style="margin-bottom:24px;"></div>
+        <div id="report-register-content"></div>
+      </div>
     </section>
   </main>
 </div>
