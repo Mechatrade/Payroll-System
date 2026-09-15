@@ -1143,6 +1143,7 @@
           <td class="num">${r.otHours}</td>
           <td class="num">${r.undertimeMinutes}</td>
           <td>${r.isLeave ? '<span class="tag" style="border-color:var(--red); color:var(--red);">Leave</span>' : '—'}</td>
+          <td>${buildPayFlagsHtml({ ot_hours: r.otHours, undertime_minutes: r.undertimeMinutes, night_minutes: r.nightMinutes }) || '<span style="color:var(--muted); font-size:11px;">—</span>'}</td>
           <td>
             <select class="att-status-select" data-idx="${idx}" style="width:100%; padding:6px 8px; border:1px solid var(--line); background:${r.isLeave ? '#FFF8EC' : 'var(--paper)'}; font-family:inherit; font-size:12.5px;">
               ${statusOptions(r.attendanceStatus)}
@@ -1155,12 +1156,12 @@
           <td colspan="2"><span class="att-chevron" data-chevron="${empId}" style="display:inline-block; width:12px;">▸</span> <strong>${group.name}</strong></td>
           <td colspan="2" style="color:var(--muted); font-size:12px;">${presentCount} present-day rows · ${leaveCount} leave</td>
           <td colspan="2" class="num" style="color:var(--muted); font-size:12px;">OT: ${otTotal}h</td>
-          <td colspan="3" style="color:${missingCount ? 'var(--red)' : 'var(--muted)'}; font-size:12px;">${missingCount ? missingCount + ' need a status' : 'All classified'}</td>
+          <td colspan="4" style="color:${missingCount ? 'var(--red)' : 'var(--muted)'}; font-size:12px;">${missingCount ? missingCount + ' need a status' : 'All classified'}</td>
         </tr>
         ${detailRows}`;
     }).join('');
 
-    document.getElementById('attendance-summary-tbody').innerHTML = groups || `<tr><td colspan="9" class="empty">No active employees with an email on file, or no data for this cutoff.</td></tr>`;
+    document.getElementById('attendance-summary-tbody').innerHTML = groups || `<tr><td colspan="10" class="empty">No active employees with an email on file, or no data for this cutoff.</td></tr>`;
 
     document.querySelectorAll('.att-group-header').forEach(header => {
       header.addEventListener('click', () => {
@@ -1419,11 +1420,21 @@
 
   let manualEntriesCache = [];
 
+  // Builds the OT / Undertime / ND at-a-glance tags for one attendance record,
+  // so what pay applies to a given day is visible without opening Processing.
+  function buildPayFlagsHtml(r) {
+    const flags = [];
+    if ((r.ot_hours || 0) > 0) flags.push(`<span class="tag tag-ot">OT ${r.ot_hours}h</span>`);
+    if ((r.undertime_minutes || 0) > 0) flags.push(`<span class="tag tag-undertime">Undertime ${Math.round(r.undertime_minutes)}min</span>`);
+    if ((r.night_minutes || 0) > 0) flags.push(`<span class="tag tag-nd">ND ${Math.round(r.night_minutes / 60 * 10) / 10}h</span>`);
+    return flags.join(' ');
+  }
+
   async function loadManualEntries() {
     const periodId = document.getElementById('att-period-select').value;
     const tbody = document.getElementById('manual-att-tbody');
     if (!tbody) return;
-    if (!periodId) { manualEntriesCache = []; tbody.innerHTML = `<tr><td colspan="6" class="empty">Select a payroll period above.</td></tr>`; return; }
+    if (!periodId) { manualEntriesCache = []; tbody.innerHTML = `<tr><td colspan="7" class="empty">Select a payroll period above.</td></tr>`; return; }
 
     const q = query(collection(db, 'attendance'), where('period_id', '==', periodId), where('source', '==', 'manual'));
     const snap = await getDocs(q);
@@ -1436,6 +1447,7 @@
 
     tbody.innerHTML = manualEntriesCache.map(r => {
       const emp = employeesCache.find(e => e.id === r.employee_id);
+      const flagsHtml = buildPayFlagsHtml(r);
       return `
         <tr>
           <td>${emp ? emp.name : r.employee_id}</td>
@@ -1443,12 +1455,13 @@
           <td>${fmtTime(r.time_in)}</td>
           <td>${fmtTime(r.time_out)}</td>
           <td>${statusLabel(r.attendance_status)}${r.is_leave ? ' <span class="tag" style="border-color:var(--red); color:var(--red);">Leave</span>' : ''}</td>
+          <td>${flagsHtml || '<span style="color:var(--muted); font-size:11px;">—</span>'}</td>
           <td>
             <button class="btn-icon" style="color:var(--navy);" onclick='__mpEditManualEntry("${r.id}")'>Edit</button>
             <button class="btn-icon" style="margin-left:10px;" onclick='__mpDeleteManualEntry("${r.id}")'>Delete</button>
           </td>
         </tr>`;
-    }).join('') || `<tr><td colspan="6" class="empty">No manual entries for this period yet.</td></tr>`;
+    }).join('') || `<tr><td colspan="7" class="empty">No manual entries for this period yet.</td></tr>`;
   }
 
   // Aggregates the saved daily records for one employee/period into the
@@ -2421,6 +2434,9 @@
 
   .tag-daily { border-color: var(--gold); color: #8a6a1f; background: var(--gold-soft); }
   .tag-monthly { border-color: var(--navy-soft); color: var(--navy-soft); background: #EAEEF5; }
+  .tag-ot { border-color: var(--gold); color: #8a6a1f; background: var(--gold-soft); font-weight: 600; }
+  .tag-undertime { border-color: var(--red); color: var(--red); background: #FBEAE8; font-weight: 600; }
+  .tag-nd { border-color: var(--navy); color: var(--navy); background: #EAEEF5; font-weight: 600; }
 
   .status { font-size: 12.5px; }
   .status-active { color: var(--green); }
@@ -2765,7 +2781,7 @@
           <thead><tr>
             <th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th>
             <th class="num">Regular hrs</th><th class="num">OT hrs</th><th class="num">Undertime (min)</th>
-            <th>Leave</th><th style="min-width:140px;">Attendance Status</th>
+            <th>Leave</th><th>Pay flags</th><th style="min-width:140px;">Attendance Status</th>
           </tr></thead>
           <tbody id="attendance-summary-tbody"></tbody>
         </table>
@@ -2812,9 +2828,9 @@
         <div style="overflow-x:auto; margin-top:18px;">
         <table>
           <thead><tr>
-            <th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th><th>Status</th><th>Actions</th>
+            <th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th><th>Status</th><th>Pay flags</th><th>Actions</th>
           </tr></thead>
-          <tbody id="manual-att-tbody"><tr><td colspan="6" class="empty">Select a payroll period above.</td></tr></tbody>
+          <tbody id="manual-att-tbody"><tr><td colspan="7" class="empty">Select a payroll period above.</td></tr></tbody>
         </table>
         </div>
       </div>
