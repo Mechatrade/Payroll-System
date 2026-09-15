@@ -73,6 +73,7 @@
     if (user) {
       currentUserRole = await ensureUserRole(user);
       document.getElementById('user-email').textContent = `${user.email} · ${currentUserRole === 'admin' ? 'Admin' : 'Staff'}`;
+      document.getElementById('nav-settings-btn').classList.toggle('hidden', currentUserRole !== 'admin');
       await loadStatutorySettings();
       loadEmployees();
       loadDashboard();
@@ -195,7 +196,7 @@
     document.getElementById('settings-readonly-notice').classList.toggle('hidden', isAdmin);
     form.querySelectorAll('input, button').forEach(el => { el.disabled = !isAdmin; });
 
-    if (statutorySettingsLoaded) {
+    if (statutorySettingsLoaded && isAdmin) {
       getDoc(doc(db, 'settings', 'statutory')).then(snap => {
         if (snap.exists() && snap.data().updated_at) {
           const d = snap.data().updated_at.toDate ? snap.data().updated_at.toDate() : null;
@@ -350,10 +351,6 @@
     });
     document.getElementById('period-form').addEventListener('submit', createPeriod);
     document.getElementById('save-batch-btn').addEventListener('click', saveBatch);
-    document.getElementById('period-type-active').addEventListener('change', (e) => {
-      e.target.dataset.type = e.target.value;
-      if (currentPeriodId) renderProcessingTable();
-    });
     document.getElementById('pull-pulsetime-btn').addEventListener('click', pullFromPulseTime);
     document.getElementById('save-attendance-btn').addEventListener('click', saveAttendanceSnapshot);
     document.getElementById('manual-att-form').addEventListener('submit', saveManualAttendance);
@@ -766,8 +763,7 @@
     // inputs (monthly-rate): { otHours, otMultiplier, holidayPay, restDayPay, nsdPay, otherEarnings, unpaidDays, otherDeductions }
     // inputs (daily-rate):   { otHours, otMultiplier, holidayPay, restDayPay, nsdPay, otherEarnings, payableDays, otherDeductions }
     // otMultiplier: blended DOLE-stacked OT rate from otMultiplierForDays() — defaults to plain 125% (Art. 87) when not supplied.
-    // taxPeriodFactor: 1 for a monthly cutoff, 0.5 for semi-monthly (tax withholding still splits evenly per cutoff — only SSS/PhilHealth/Pag-IBIG follow the first/second-cutoff rule).
-    computeRecord(employee, inputs, period, taxPeriodFactor = 0.5, divisor = 26) {
+    computeRecord(employee, inputs, period, divisor = 26) {
       const ot = this.overtimePay(employee, inputs.otHours || 0, divisor, 8, inputs.otMultiplier || 1.25);
       const holidayPay = inputs.holidayPay || 0;
       const restDayPay = inputs.restDayPay || 0;
@@ -810,9 +806,12 @@
       const pagibig = this.pagibigEmployeeShare(monthlyComp) * statutoryMultiplier;
       const pagibigEmployer = this.pagibigEmployerShare(monthlyComp) * statutoryMultiplier;
 
-      // Withholding tax keeps the existing per-cutoff split (unaffected by the new SSS/PhilHealth/Pag-IBIG timing rule).
+      // Withholding tax now follows the SAME first/second-cutoff rule as
+      // SSS/PhilHealth/Pag-IBIG (confirmed policy: zero deduction of any kind
+      // on the first cutoff, full monthly amount on the second) — no longer
+      // split 50/50 across both cutoffs.
       const taxableIncome = Math.max(monthlyComp - (this.sssEmployeeShare(monthlyComp) + this.philhealthEmployeeShare(monthlyComp) + this.pagibigEmployeeShare(monthlyComp)), 0);
-      const tax = this.withholdingTax(taxableIncome) * taxPeriodFactor * (basicEarned <= 0 ? 0 : 1);
+      const tax = this.withholdingTax(taxableIncome) * statutoryMultiplier;
 
       const totalDeductions = sss + philhealth + pagibig + tax + otherDeductions;
       const grossRaw = gross;
@@ -1027,10 +1026,30 @@
             // count it and understate hours actually worked.
             const lunchMinutes = (entry.sessionCount === 1 && entry.spanMinutes > 60) ? 60 : 0;
             const workedMinutes = Math.max(entry.spanMinutes - lunchMinutes, 0);
-            const regularMinutes = Math.min(workedMinutes, 8 * 60);
-            const otMinutes = Math.max(workedMinutes - 8 * 60, 0);
-            const undertimeMinutes = Math.max(8 * 60 - workedMinutes, 0);
             const nightMinutes = window.__mpCalc.nightShiftMinutes(entry.earliestStart, entry.latestEnd);
+
+            // Confirmed policy: a plain worked Saturday/Sunday (no holiday
+            // declared) is NOT treated as rest-day-premium pay. For a
+            // Monthly-rate employee it's folded entirely into OT hours
+            // instead (their salary already covers weekdays, and a weekend
+            // is simply extra time on top). For a Daily-rate employee it's
+            // just an ordinary worked day — counts toward Payable Days like
+            // any weekday, split into regular/OT the normal way, no premium.
+            // Either way, dayType is downgraded to 'regular' so
+            // computeSpecialDayPay doesn't ALSO add a rest-day premium on
+            // top of this. Holiday-weekend combos (e.g. regular_holiday_
+            // rest_day) are untouched — this only applies to a plain weekend.
+            const isPlainWeekend = dayType === 'rest_day';
+            const effectiveDayType = isPlainWeekend ? 'regular' : dayType;
+            let regularMinutes, otMinutes;
+            if (isPlainWeekend && emp.rate_type === 'monthly') {
+              regularMinutes = 0;
+              otMinutes = workedMinutes;
+            } else {
+              regularMinutes = Math.min(workedMinutes, 8 * 60);
+              otMinutes = Math.max(workedMinutes - 8 * 60, 0);
+            }
+            const undertimeMinutes = Math.max(8 * 60 - workedMinutes, 0);
             // Auto-classify: ~4 worked hours reads as a half day; anything
             // else with actual time in/out (including a full 8hrs) reads as
             // Present. Admin can still override via the dropdown. This
@@ -1047,7 +1066,7 @@
               lateMinutes: 0,
               undertimeMinutes: Math.round(undertimeMinutes),
               nightMinutes,
-              isLeave: false, attendanceStatus: autoStatus, dayType
+              isLeave: false, attendanceStatus: autoStatus, dayType: effectiveDayType
             });
           } else if (dayType === 'rest_day' || dayType === 'special_non_working' || dayType === 'special_rest_day') {
             weekendNonWorkDays.push({ employeeId: emp.id, date: dateKey });
@@ -1289,16 +1308,32 @@
 
     const computed = computeManualHours(date, timeInStr, timeOutStr);
     let isLeave, regularHours = 0, otHours = 0, undertimeMinutes = 0, timeInISO = null, timeOutISO = null, nightMinutes = 0;
-    const dayType = classifyDay(date);
+    let dayType = classifyDay(date);
+    const employee = employeesCache.find(e => e.id === employeeId);
 
     if (computed) {
       isLeave = false;
-      regularHours = computed.regularHours;
-      otHours = computed.otHours;
       undertimeMinutes = computed.undertimeMinutes;
       timeInISO = computed.timeInISO;
       timeOutISO = computed.timeOutISO;
       nightMinutes = computed.nightMinutes;
+      // Same plain-weekend rule as the PulseTime pull: a worked Sat/Sun with
+      // no holiday declared isn't rest-day-premium pay — Monthly folds fully
+      // into OT, Daily keeps a normal regular/OT split — either way dayType
+      // downgrades to 'regular' so no separate premium gets computed.
+      if (dayType === 'rest_day') {
+        dayType = 'regular';
+        if (employee && employee.rate_type === 'monthly') {
+          regularHours = 0;
+          otHours = Math.round((computed.workedMinutes / 60) * 100) / 100;
+        } else {
+          regularHours = computed.regularHours;
+          otHours = computed.otHours;
+        }
+      } else {
+        regularHours = computed.regularHours;
+        otHours = computed.otHours;
+      }
       if (!status) status = (computed.workedMinutes >= 180 && computed.workedMinutes <= 300) ? 'HALF_DAY' : 'PRESENT';
     } else {
       isLeave = true;
@@ -1306,7 +1341,6 @@
       // admin can add a partial time in/out instead if they want it computed.
     }
 
-    const employee = employeesCache.find(e => e.id === employeeId);
     const docId = `${periodId}_${employeeId}_${date}`;
     const btn = document.getElementById('manual-att-save-btn');
     btn.disabled = true;
@@ -1514,8 +1548,6 @@
   };
 
   async function renderProcessingTable() {
-    const periodType = document.getElementById('period-type-active').dataset.type || 'semi-monthly';
-    const taxFactor = periodType === 'monthly' ? 1 : 0.5;
     const period = periodsCache.find(p => p.id === currentPeriodId);
     const activeEmployees = employeesCache.filter(e => e.status === 'active');
 
@@ -1524,14 +1556,19 @@
       snapshots[emp.id] = await getAttendanceSnapshot(currentPeriodId, emp.id);
     }));
 
-    // Show the current cutoff's statutory position so it's obvious why SSS/PhilHealth/Pag-IBIG might read ₱0.
+    // Show the real period type and the current cutoff's statutory position, so
+    // it's obvious why SSS/PhilHealth/Pag-IBIG/Tax might read ₱0 this cutoff.
+    const typeLabel = document.getElementById('period-type-label');
     const cutoffBadge = document.getElementById('cutoff-position-badge');
-    if (cutoffBadge && period) {
-      const position = window.__mpCalc.determineCutoffPosition(period);
-      const label = position === 'first' ? 'First cutoff — SSS/PhilHealth/Pag-IBIG deduction: ₱0'
-        : position === 'second' ? 'Second cutoff — full month\'s SSS/PhilHealth/Pag-IBIG deducted here'
-        : 'Monthly cutoff — full statutory deduction';
-      cutoffBadge.textContent = label;
+    if (period) {
+      if (typeLabel) typeLabel.textContent = period.period_type === 'monthly' ? 'Monthly cutoff (single cutoff covers the whole month)' : 'Semi-monthly cutoff';
+      if (cutoffBadge) {
+        const position = window.__mpCalc.determineCutoffPosition(period);
+        const label = position === 'first' ? 'First cutoff — all statutory deductions (SSS/PhilHealth/Pag-IBIG/Tax): ₱0'
+          : position === 'second' ? 'Second cutoff — full month\'s statutory deductions applied here'
+          : 'Monthly cutoff — full statutory deduction';
+        cutoffBadge.textContent = label;
+      }
     }
 
     const monthlyRows = activeEmployees.filter(e => e.rate_type === 'monthly').map(emp => {
@@ -1580,12 +1617,12 @@
     document.getElementById('processing-tbody-daily').innerHTML = dailyRows || `<tr><td colspan="10" class="empty">No active daily-rate employees.</td></tr>`;
 
     document.querySelectorAll('#processing-tbody-monthly .cell-input, #processing-tbody-daily .cell-input')
-      .forEach(inp => inp.addEventListener('input', () => recomputeRow(inp.closest('tr'), period, taxFactor)));
+      .forEach(inp => inp.addEventListener('input', () => recomputeRow(inp.closest('tr'), period)));
     document.querySelectorAll('#processing-tbody-monthly tr[data-emp-id], #processing-tbody-daily tr[data-emp-id]')
-      .forEach(tr => recomputeRow(tr, period, taxFactor));
+      .forEach(tr => recomputeRow(tr, period));
   }
 
-  function recomputeRow(tr, period, taxFactor) {
+  function recomputeRow(tr, period) {
     const empId = tr.dataset.empId;
     const emp = employeesCache.find(e => e.id === empId);
     if (!emp || !period) return;
@@ -1604,7 +1641,7 @@
           otherEarnings: val('otherEarnings')
         };
 
-    const rec = window.__mpCalc.computeRecord(emp, inputs, period, taxFactor);
+    const rec = window.__mpCalc.computeRecord(emp, inputs, period);
     tr.querySelector('.result-gross').textContent = '₱' + rec.gross.toLocaleString('en-PH', {minimumFractionDigits: 2});
     tr.querySelector('.result-deductions').textContent = '₱' + rec.totalDeductions.toLocaleString('en-PH', {minimumFractionDigits: 2});
     const netCell = tr.querySelector('.result-net');
@@ -2575,7 +2612,7 @@
     <button class="nav-item" data-target="view-approval">Approval</button>
     <button class="nav-item" data-target="view-payslip">Payslips</button>
     <button class="nav-item" data-target="view-reports">Reports</button>
-    <button class="nav-item" data-target="view-settings">Settings</button>
+    <button class="nav-item" id="nav-settings-btn" data-target="view-settings">Settings</button>
   </nav>
 
   <main class="main">
@@ -2849,11 +2886,7 @@
       <div class="panel hidden" id="processing-workspace">
         <h3>Process cutoff</h3>
         <div class="panel-sub">
-          Statutory basis:
-          <select id="period-type-active" data-type="semi-monthly" style="border:1px solid var(--line); font-family:inherit; padding:4px 8px;">
-            <option value="semi-monthly" selected>Semi-monthly (tax split per cutoff)</option>
-            <option value="monthly">Monthly (single cutoff)</option>
-          </select>
+          <span id="period-type-label"></span>
           <span id="cutoff-position-badge" style="margin-left:14px; font-size:12.5px; color:var(--gold); font-weight:500;"></span>
         </div>
 
@@ -2957,7 +2990,7 @@
 
     <section id="view-settings" class="view hidden">
       <div class="panel hidden" id="settings-readonly-notice">
-        <div class="panel-sub" style="margin:0;">Viewing statutory rates and pay-premium multipliers below. Only an admin account can edit these — changes here take effect immediately for everyone, without a redeploy.</div>
+        <div class="panel-sub" style="margin:0;">This page is restricted to admin accounts. If you're seeing this, your account doesn't have access — statutory settings changes take effect immediately for the whole system once saved.</div>
       </div>
       <form id="settings-form">
         <div class="panel">
