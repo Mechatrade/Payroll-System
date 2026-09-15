@@ -122,12 +122,13 @@
         if (data.dayTypeWorked) window.__mpCalc.DAY_TYPE_WORKED_MULTIPLIER = data.dayTypeWorked;
         if (data.dayTypeOT) window.__mpCalc.DAY_TYPE_OT_MULTIPLIER = data.dayTypeOT;
         if (typeof data.nsdRate === 'number') NSD_RATE = data.nsdRate;
+        if (typeof data.doleDailyRateFactor === 'number') DOLE_DAILY_RATE_FACTOR = data.doleDailyRateFactor;
       } else {
         await setDoc(ref, {
           sss: STATUTORY_2026.sss, philhealth: STATUTORY_2026.philhealth, pagibig: STATUTORY_2026.pagibig,
           taxMonthly: STATUTORY_2026.taxMonthly,
           dayTypeWorked: window.__mpCalc.DAY_TYPE_WORKED_MULTIPLIER, dayTypeOT: window.__mpCalc.DAY_TYPE_OT_MULTIPLIER,
-          nsdRate: NSD_RATE, seeded_at: serverTimestamp()
+          nsdRate: NSD_RATE, doleDailyRateFactor: DOLE_DAILY_RATE_FACTOR, seeded_at: serverTimestamp()
         });
       }
       statutorySettingsLoaded = true;
@@ -146,6 +147,7 @@
     window.__mpCalc.DAY_TYPE_WORKED_MULTIPLIER = payload.dayTypeWorked;
     window.__mpCalc.DAY_TYPE_OT_MULTIPLIER = payload.dayTypeOT;
     NSD_RATE = payload.nsdRate;
+    DOLE_DAILY_RATE_FACTOR = payload.doleDailyRateFactor;
   }
 
   const DAY_TYPE_LABELS = {
@@ -188,6 +190,7 @@
     document.getElementById('set-pi-mfsCap').value = STATUTORY_2026.pagibig.mfsCap;
 
     document.getElementById('set-nsd-rate').value = pct(NSD_RATE);
+    document.getElementById('set-dole-factor').value = DOLE_DAILY_RATE_FACTOR;
 
     renderTaxBracketRows(STATUTORY_2026.taxMonthly);
     renderDayTypeRows(window.__mpCalc.DAY_TYPE_WORKED_MULTIPLIER, window.__mpCalc.DAY_TYPE_OT_MULTIPLIER);
@@ -268,7 +271,8 @@
       },
       taxMonthly,
       dayTypeWorked, dayTypeOT,
-      nsdRate: frac(document.getElementById('set-nsd-rate').value)
+      nsdRate: frac(document.getElementById('set-nsd-rate').value),
+      doleDailyRateFactor: parseFloat(document.getElementById('set-dole-factor').value) || 261
     };
   }
 
@@ -527,17 +531,23 @@
     ]
   };
   let NSD_RATE = 0.10; // night shift differential, 10% (Labor Code Art. 86) — Settings-editable
+  let DOLE_DAILY_RATE_FACTOR = 261; // EEMR factor for Monthly-rate daily-equivalent (261 = Mon-Fri, holidays paid) — Settings-editable
 
   // ---------- Payroll calculation engine (shared logic, daily + monthly) ----------
   // Kept here as the seed for shared/payroll-calc.js once the module is split out.
   window.__mpCalc = {
     // Converts a monthly rate to an equivalent daily rate for OT / holiday pay math.
-    getDailyRateEquivalent(employee, divisor = 26) {
+    // Confirmed policy: Mechatrade's Monthly-rate staff work Mon–Fri with paid
+    // holidays — per the DOLE-BWC Handbook on Workers' Statutory Monetary
+    // Benefits (EEMR method), that's Factor 261. Formula: (Monthly Rate × 12) ÷
+    // Factor. DOLE_DAILY_RATE_FACTOR is Settings-editable in case the actual
+    // work schedule differs (365 = paid every day; 313 = 6-day week).
+    getDailyRateEquivalent(employee) {
       if (employee.rate_type === 'daily') return employee.rate_amount;
-      return employee.rate_amount / divisor;
+      return (employee.rate_amount * 12) / DOLE_DAILY_RATE_FACTOR;
     },
-    overtimePay(employee, otHours, divisor = 26, hoursPerDay = 8, otMultiplier = 1.25) {
-      const hourlyRate = this.getDailyRateEquivalent(employee, divisor) / hoursPerDay;
+    overtimePay(employee, otHours, hoursPerDay = 8, otMultiplier = 1.25) {
+      const hourlyRate = this.getDailyRateEquivalent(employee) / hoursPerDay;
       return hourlyRate * otHours * otMultiplier;
     },
     // Monthly-equivalent compensation. Kept for reference/other callers, but
@@ -698,8 +708,8 @@
     // salary, so only the premium portion is added there too. Unworked
     // holidays add nothing extra for monthly staff (already salaried) and
     // are covered via the payable-days count for daily staff.
-    computeSpecialDayPay(days, employee, divisor = 26) {
-      const dailyRate = this.getDailyRateEquivalent(employee, divisor);
+    computeSpecialDayPay(days, employee) {
+      const dailyRate = this.getDailyRateEquivalent(employee);
       const hourlyRate = dailyRate / 8;
       const isMonthly = employee.rate_type === 'monthly';
       let holidayPay = 0, restDayPay = 0, nsdPay = 0;
@@ -745,8 +755,8 @@
     // reflecting correct DOLE stacking (a rest-day or holiday OT hour costs
     // more than an ordinary one) instead of a flat 125% for everything.
     // Falls back to plain 125% when there's no attendance data to blend from.
-    otMultiplierForDays(days, employee, divisor = 26) {
-      const hourlyRate = this.getDailyRateEquivalent(employee, divisor) / 8;
+    otMultiplierForDays(days, employee) {
+      const hourlyRate = this.getDailyRateEquivalent(employee) / 8;
       let totalOtHours = 0, totalOtPay = 0;
       (days || []).forEach(d => {
         const otHours = d.ot_hours || 0;
@@ -763,8 +773,8 @@
     // inputs (monthly-rate): { otHours, otMultiplier, holidayPay, restDayPay, nsdPay, otherEarnings, unpaidDays, otherDeductions }
     // inputs (daily-rate):   { otHours, otMultiplier, holidayPay, restDayPay, nsdPay, otherEarnings, payableDays, otherDeductions }
     // otMultiplier: blended DOLE-stacked OT rate from otMultiplierForDays() — defaults to plain 125% (Art. 87) when not supplied.
-    computeRecord(employee, inputs, period, divisor = 26) {
-      const ot = this.overtimePay(employee, inputs.otHours || 0, divisor, 8, inputs.otMultiplier || 1.25);
+    computeRecord(employee, inputs, period) {
+      const ot = this.overtimePay(employee, inputs.otHours || 0, 8, inputs.otMultiplier || 1.25);
       const holidayPay = inputs.holidayPay || 0;
       const restDayPay = inputs.restDayPay || 0;
       const nsdPay = inputs.nsdPay || 0;
@@ -774,7 +784,7 @@
       let basic, unpaidDeduction = 0;
       if (employee.rate_type === 'monthly') {
         const semiMonthlyBase = employee.rate_amount / 2;
-        const dailyEquivalent = employee.rate_amount / divisor;
+        const dailyEquivalent = this.getDailyRateEquivalent(employee); // DOLE EEMR factor, not a flat ÷26
         unpaidDeduction = (inputs.unpaidDays || 0) * dailyEquivalent;
         basic = semiMonthlyBase;
       } else {
@@ -1575,8 +1585,8 @@
       const snap = snapshots[emp.id];
       const unpaidDays = snap ? snap.unpaid_days : 0;
       const ot = snap ? snap.ot_hours : 0;
-      const premium = snap ? window.__mpCalc.computeSpecialDayPay(snap.days, emp, 26) : { holidayPay: 0, restDayPay: 0, nsdPay: 0 };
-      const otMultiplier = snap ? window.__mpCalc.otMultiplierForDays(snap.days, emp, 26) : 1.25;
+      const premium = snap ? window.__mpCalc.computeSpecialDayPay(snap.days, emp) : { holidayPay: 0, restDayPay: 0, nsdPay: 0 };
+      const otMultiplier = snap ? window.__mpCalc.otMultiplierForDays(snap.days, emp) : 1.25;
       return `
         <tr data-emp-id="${emp.id}" data-rate-type="monthly" data-ot-multiplier="${otMultiplier}">
           <td>${emp.name}<div style="font-size:11px;color:var(--muted);">₱${emp.rate_amount}/mo${snap ? ' · from attendance records' : ''}</div></td>
@@ -1596,8 +1606,8 @@
       const snap = snapshots[emp.id];
       const days = snap ? snap.days_present : 13;
       const ot = snap ? snap.ot_hours : 0;
-      const premium = snap ? window.__mpCalc.computeSpecialDayPay(snap.days, emp, 26) : { holidayPay: 0, restDayPay: 0, nsdPay: 0 };
-      const otMultiplier = snap ? window.__mpCalc.otMultiplierForDays(snap.days, emp, 26) : 1.25;
+      const premium = snap ? window.__mpCalc.computeSpecialDayPay(snap.days, emp) : { holidayPay: 0, restDayPay: 0, nsdPay: 0 };
+      const otMultiplier = snap ? window.__mpCalc.otMultiplierForDays(snap.days, emp) : 1.25;
       return `
         <tr data-emp-id="${emp.id}" data-rate-type="daily" data-ot-multiplier="${otMultiplier}">
           <td>${emp.name}<div style="font-size:11px;color:var(--muted);">₱${emp.rate_amount}/day${snap ? ' · from attendance records' : ''}</div></td>
@@ -3051,6 +3061,14 @@
           <h3>Night shift differential</h3>
           <div class="form-grid">
             <div class="field"><label>NSD rate (%)</label><input type="number" id="set-nsd-rate" step="0.01" min="0"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Monthly-rate daily equivalent (DOLE EEMR factor)</h3>
+          <div class="panel-sub">Per the DOLE-BWC Handbook on Workers' Statutory Monetary Benefits: Daily Rate = (Monthly Rate × 12) ÷ Factor. Used for OT, holiday pay, rest day pay, NSD, and unpaid-days deductions for Monthly-rate employees. Common factors: 365 (paid every day), 313 (6-day week), 261 (5-day week, current setting).</div>
+          <div class="form-grid">
+            <div class="field"><label>Factor (days/year)</label><input type="number" id="set-dole-factor" step="1" min="1"></div>
           </div>
         </div>
 
