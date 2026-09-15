@@ -187,9 +187,7 @@
     document.getElementById('manual-att-form').addEventListener('submit', saveManualAttendance);
     document.getElementById('manual-att-cancel-btn').addEventListener('click', exitManualAttEditMode);
     document.getElementById('manual-att-status').addEventListener('change', updateManualAttTimeRequirement);
-    document.getElementById('att-period-select').addEventListener('change', () => { syncManualAttFilterToPeriod(); loadManualEntries(); });
-    document.getElementById('manual-att-filter-from').addEventListener('change', loadManualEntries);
-    document.getElementById('manual-att-filter-to').addEventListener('change', loadManualEntries);
+    document.getElementById('att-period-select').addEventListener('change', () => loadManualEntries());
     document.getElementById('manual-att-status').innerHTML = ATTENDANCE_STATUSES.map(s =>
       `<option value="${s.value}">${s.label}</option>`).join('');
     updateManualAttTimeRequirement();
@@ -921,32 +919,13 @@
 
   let manualEntriesCache = [];
 
-  // Sets the cutoff-filter inputs to the currently selected period's dates.
-  // Called when the admin explicitly switches periods (a deliberate "show me
-  // this cutoff" action) — never called automatically on background refreshes,
-  // so it can't silently overwrite a filter range the admin set on purpose.
-  function syncManualAttFilterToPeriod() {
-    const periodId = document.getElementById('att-period-select').value;
-    const period = periodsCache.find(p => p.id === periodId);
-    const fromEl = document.getElementById('manual-att-filter-from');
-    const toEl = document.getElementById('manual-att-filter-to');
-    if (!fromEl || !toEl || !period) return;
-    fromEl.value = period.cutoff_start;
-    toEl.value = period.cutoff_end;
-  }
-
   async function loadManualEntries() {
+    const periodId = document.getElementById('att-period-select').value;
     const tbody = document.getElementById('manual-att-tbody');
     if (!tbody) return;
-    const from = document.getElementById('manual-att-filter-from')?.value;
-    const to = document.getElementById('manual-att-filter-to')?.value;
-    if (!from || !to) { manualEntriesCache = []; tbody.innerHTML = `<tr><td colspan="6" class="empty">Select a cutoff date range above.</td></tr>`; return; }
+    if (!periodId) { manualEntriesCache = []; tbody.innerHTML = `<tr><td colspan="6" class="empty">Select a payroll period above.</td></tr>`; return; }
 
-    // Filtered by date range, not period_id — manual entries are never
-    // deleted when the admin switches periods; this only changes which
-    // date range is shown. Widening the "from"/"to" dates surfaces entries
-    // saved under other cutoffs too, without touching the underlying data.
-    const q = query(collection(db, 'attendance'), where('source', '==', 'manual'), where('date', '>=', from), where('date', '<=', to));
+    const q = query(collection(db, 'attendance'), where('period_id', '==', periodId), where('source', '==', 'manual'));
     const snap = await getDocs(q);
     manualEntriesCache = [];
     snap.forEach(d => manualEntriesCache.push({ id: d.id, ...d.data() }));
@@ -969,7 +948,7 @@
             <button class="btn-icon" style="margin-left:10px;" onclick='__mpDeleteManualEntry("${r.id}")'>Delete</button>
           </td>
         </tr>`;
-    }).join('') || `<tr><td colspan="6" class="empty">No manual entries in this date range.</td></tr>`;
+    }).join('') || `<tr><td colspan="6" class="empty">No manual entries for this period yet.</td></tr>`;
   }
 
   // Aggregates the saved daily records for one employee/period into the
@@ -1027,11 +1006,6 @@
     const current = sel.value;
     sel.innerHTML = periodsCache.map(p => `<option value="${p.id}">${p.cutoff_start} – ${p.cutoff_end}</option>`).join('') || '<option value="">No periods yet</option>';
     if (current && periodsCache.find(p => p.id === current)) sel.value = current;
-    // Only auto-sync the manual-entry date filter the first time a period
-    // becomes selected (filter inputs still empty) — once the admin has a
-    // filter range set, further period/list refreshes shouldn't clobber it.
-    const fromEl = document.getElementById('manual-att-filter-from');
-    if (fromEl && !fromEl.value) syncManualAttFilterToPeriod();
     loadManualEntries();
   }
 
@@ -1841,7 +1815,7 @@
   .main {
     flex: 1;
     padding: 28px 36px 60px;
-    max-width: 1100px;
+    max-width: 1440px;
   }
 
   .topbar {
@@ -2304,24 +2278,12 @@
         </form>
         <div class="panel-sub" style="margin-top:6px;">Leave a whole day out of time in/out and pick a status (e.g. Paid Leave) instead — hours are left at 0 for those days.</div>
 
-        <div class="panel-sub" style="margin-top:20px; margin-bottom:6px;">Entries are never deleted by switching periods — this only filters which ones are listed below. Defaults to the selected period's cutoff dates; widen it to review entries from other cutoffs.</div>
-        <div class="form-grid" style="grid-template-columns: 1fr 1fr; gap:12px;">
-          <div class="field">
-            <label for="manual-att-filter-from">Cutoff filter — from</label>
-            <input type="date" id="manual-att-filter-from" style="width:100%; padding:8px 10px; border:1px solid var(--line); font-family:inherit; font-size:13px;">
-          </div>
-          <div class="field">
-            <label for="manual-att-filter-to">Cutoff filter — to</label>
-            <input type="date" id="manual-att-filter-to" style="width:100%; padding:8px 10px; border:1px solid var(--line); font-family:inherit; font-size:13px;">
-          </div>
-        </div>
-
-        <div style="overflow-x:auto; margin-top:12px;">
+        <div style="overflow-x:auto; margin-top:18px;">
         <table>
           <thead><tr>
             <th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th><th>Status</th><th>Actions</th>
           </tr></thead>
-          <tbody id="manual-att-tbody"><tr><td colspan="6" class="empty">Select a payroll period and cutoff filter above.</td></tr></tbody>
+          <tbody id="manual-att-tbody"><tr><td colspan="6" class="empty">Select a payroll period above.</td></tr></tbody>
         </table>
         </div>
       </div>
