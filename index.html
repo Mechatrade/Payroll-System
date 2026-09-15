@@ -187,7 +187,9 @@
     document.getElementById('manual-att-form').addEventListener('submit', saveManualAttendance);
     document.getElementById('manual-att-cancel-btn').addEventListener('click', exitManualAttEditMode);
     document.getElementById('manual-att-status').addEventListener('change', updateManualAttTimeRequirement);
-    document.getElementById('att-period-select').addEventListener('change', () => loadManualEntries());
+    document.getElementById('att-period-select').addEventListener('change', () => { syncManualAttFilterToPeriod(); loadManualEntries(); });
+    document.getElementById('manual-att-filter-from').addEventListener('change', loadManualEntries);
+    document.getElementById('manual-att-filter-to').addEventListener('change', loadManualEntries);
     document.getElementById('manual-att-status').innerHTML = ATTENDANCE_STATUSES.map(s =>
       `<option value="${s.value}">${s.label}</option>`).join('');
     updateManualAttTimeRequirement();
@@ -292,7 +294,6 @@
       document.getElementById('stat-active-count').textContent = activeCount;
       document.getElementById('stat-daily-count').textContent = dailyCount;
       document.getElementById('stat-monthly-count').textContent = monthlyCount;
-      populateManualAttEmployeeSelect();
     });
   }
 
@@ -920,13 +921,32 @@
 
   let manualEntriesCache = [];
 
-  async function loadManualEntries() {
+  // Sets the cutoff-filter inputs to the currently selected period's dates.
+  // Called when the admin explicitly switches periods (a deliberate "show me
+  // this cutoff" action) — never called automatically on background refreshes,
+  // so it can't silently overwrite a filter range the admin set on purpose.
+  function syncManualAttFilterToPeriod() {
     const periodId = document.getElementById('att-period-select').value;
+    const period = periodsCache.find(p => p.id === periodId);
+    const fromEl = document.getElementById('manual-att-filter-from');
+    const toEl = document.getElementById('manual-att-filter-to');
+    if (!fromEl || !toEl || !period) return;
+    fromEl.value = period.cutoff_start;
+    toEl.value = period.cutoff_end;
+  }
+
+  async function loadManualEntries() {
     const tbody = document.getElementById('manual-att-tbody');
     if (!tbody) return;
-    if (!periodId) { manualEntriesCache = []; tbody.innerHTML = `<tr><td colspan="6" class="empty">Select a payroll period above.</td></tr>`; return; }
+    const from = document.getElementById('manual-att-filter-from')?.value;
+    const to = document.getElementById('manual-att-filter-to')?.value;
+    if (!from || !to) { manualEntriesCache = []; tbody.innerHTML = `<tr><td colspan="6" class="empty">Select a cutoff date range above.</td></tr>`; return; }
 
-    const q = query(collection(db, 'attendance'), where('period_id', '==', periodId), where('source', '==', 'manual'));
+    // Filtered by date range, not period_id — manual entries are never
+    // deleted when the admin switches periods; this only changes which
+    // date range is shown. Widening the "from"/"to" dates surfaces entries
+    // saved under other cutoffs too, without touching the underlying data.
+    const q = query(collection(db, 'attendance'), where('source', '==', 'manual'), where('date', '>=', from), where('date', '<=', to));
     const snap = await getDocs(q);
     manualEntriesCache = [];
     snap.forEach(d => manualEntriesCache.push({ id: d.id, ...d.data() }));
@@ -949,7 +969,7 @@
             <button class="btn-icon" style="margin-left:10px;" onclick='__mpDeleteManualEntry("${r.id}")'>Delete</button>
           </td>
         </tr>`;
-    }).join('') || `<tr><td colspan="6" class="empty">No manual entries for this period yet.</td></tr>`;
+    }).join('') || `<tr><td colspan="6" class="empty">No manual entries in this date range.</td></tr>`;
   }
 
   // Aggregates the saved daily records for one employee/period into the
@@ -1007,6 +1027,11 @@
     const current = sel.value;
     sel.innerHTML = periodsCache.map(p => `<option value="${p.id}">${p.cutoff_start} – ${p.cutoff_end}</option>`).join('') || '<option value="">No periods yet</option>';
     if (current && periodsCache.find(p => p.id === current)) sel.value = current;
+    // Only auto-sync the manual-entry date filter the first time a period
+    // becomes selected (filter inputs still empty) — once the admin has a
+    // filter range set, further period/list refreshes shouldn't clobber it.
+    const fromEl = document.getElementById('manual-att-filter-from');
+    if (fromEl && !fromEl.value) syncManualAttFilterToPeriod();
     loadManualEntries();
   }
 
@@ -1624,6 +1649,7 @@
     onSnapshot(q, (snap) => {
       employeesCache = [];
       snap.forEach(d => employeesCache.push({ id: d.id, ...d.data() }));
+      populateManualAttEmployeeSelect();
     });
   }
 </script>
@@ -1857,6 +1883,16 @@
   .panel h3 { font-size: 16px; margin-bottom: 4px; }
   .panel .panel-sub { color: var(--muted); font-size: 12.5px; margin-bottom: 18px; }
 
+  /* ---------- Attendance: two-column layout (pull/pulled-records left, manual entry right) ---------- */
+  .attendance-grid {
+    display: grid;
+    grid-template-columns: 1.3fr 1fr;
+    gap: 24px;
+    align-items: start;
+  }
+  .attendance-col-left, .attendance-col-right { min-width: 0; }
+  .attendance-col-right .panel { margin-bottom: 0; }
+
   /* ---------- Forms (employee entry) ---------- */
   .form-grid {
     display: grid;
@@ -2004,6 +2040,7 @@
     .form-grid { grid-template-columns: 1fr; }
     .stat-grid { grid-template-columns: repeat(2, 1fr); }
     .main { padding: 20px; }
+    .attendance-grid { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -2201,6 +2238,8 @@
 
     <!-- Placeholder views -->
     <section id="view-attendance" class="view hidden">
+      <div class="attendance-grid">
+      <div class="attendance-col-left">
       <div class="panel">
         <h3>Pull attendance from PulseTime</h3>
         <div class="panel-sub">Reads raw time-in/time-out sessions for a cutoff's date range from Mechatrade PulseTime (read-only), matched to employees by email.</div>
@@ -2210,47 +2249,6 @@
             <select id="att-period-select" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
           </div>
           <button type="button" class="btn-add" id="pull-pulsetime-btn">Pull from PulseTime</button>
-        </div>
-      </div>
-
-      <div class="panel" id="manual-attendance-panel">
-        <h3 id="manual-att-form-title">Manual time entry</h3>
-        <div class="panel-sub">For staff not enrolled in PulseTime (or to hand-correct a specific day). Uses the payroll period selected above — pick that first. Saving a manual entry for a date that was already pulled from PulseTime replaces that day's record.</div>
-        <form id="manual-att-form" class="form-grid" style="grid-template-columns: 1.4fr 1fr 0.8fr 0.8fr 1fr; align-items: end; gap:12px;">
-          <div class="field">
-            <label for="manual-att-employee">Employee</label>
-            <select id="manual-att-employee" required style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
-          </div>
-          <div class="field">
-            <label for="manual-att-date">Date</label>
-            <input type="date" id="manual-att-date" required style="width:100%; padding:10px 12px; border:1px solid var(--line); font-family:inherit; font-size:14px;">
-          </div>
-          <div class="field">
-            <label for="manual-att-timein">Time in</label>
-            <input type="time" id="manual-att-timein" style="width:100%; padding:10px 12px; border:1px solid var(--line); font-family:inherit; font-size:14px;">
-          </div>
-          <div class="field">
-            <label for="manual-att-timeout">Time out</label>
-            <input type="time" id="manual-att-timeout" style="width:100%; padding:10px 12px; border:1px solid var(--line); font-family:inherit; font-size:14px;">
-          </div>
-          <div class="field">
-            <label for="manual-att-status">Attendance status</label>
-            <select id="manual-att-status" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
-          </div>
-          <div style="grid-column: 1 / -1; display:flex; gap:10px; margin-top:4px;">
-            <button type="submit" class="btn-add" id="manual-att-save-btn">Add entry</button>
-            <button type="button" class="btn-icon hidden" id="manual-att-cancel-btn">Cancel edit</button>
-          </div>
-        </form>
-        <div class="panel-sub" style="margin-top:6px;">Leave a whole day out of time in/out and pick a status (e.g. Paid Leave) instead — hours are left at 0 for those days.</div>
-
-        <div style="overflow-x:auto; margin-top:18px;">
-        <table>
-          <thead><tr>
-            <th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th><th>Status</th><th>Actions</th>
-          </tr></thead>
-          <tbody id="manual-att-tbody"><tr><td colspan="6" class="empty">Select a payroll period above.</td></tr></tbody>
-        </table>
         </div>
       </div>
 
@@ -2271,6 +2269,63 @@
         <div style="margin-top:18px;">
           <button class="btn-add" id="save-attendance-btn">Save to payroll attendance</button>
         </div>
+      </div>
+      </div>
+
+      <div class="attendance-col-right">
+      <div class="panel" id="manual-attendance-panel">
+        <h3 id="manual-att-form-title">Manual time entry</h3>
+        <div class="panel-sub">For staff not enrolled in PulseTime (or to hand-correct a specific day). Uses the payroll period selected on the left — pick that first. Saving a manual entry for a date that was already pulled from PulseTime replaces that day's record.</div>
+        <form id="manual-att-form" class="form-grid" style="grid-template-columns: 1fr 1fr; align-items: end; gap:12px;">
+          <div class="field">
+            <label for="manual-att-employee">Employee</label>
+            <select id="manual-att-employee" required style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+          </div>
+          <div class="field">
+            <label for="manual-att-date">Date</label>
+            <input type="date" id="manual-att-date" required style="width:100%; padding:10px 12px; border:1px solid var(--line); font-family:inherit; font-size:14px;">
+          </div>
+          <div class="field">
+            <label for="manual-att-timein">Time in</label>
+            <input type="time" id="manual-att-timein" style="width:100%; padding:10px 12px; border:1px solid var(--line); font-family:inherit; font-size:14px;">
+          </div>
+          <div class="field">
+            <label for="manual-att-timeout">Time out</label>
+            <input type="time" id="manual-att-timeout" style="width:100%; padding:10px 12px; border:1px solid var(--line); font-family:inherit; font-size:14px;">
+          </div>
+          <div class="field" style="grid-column: 1 / -1;">
+            <label for="manual-att-status">Attendance status</label>
+            <select id="manual-att-status" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+          </div>
+          <div style="grid-column: 1 / -1; display:flex; gap:10px; margin-top:4px;">
+            <button type="submit" class="btn-add" id="manual-att-save-btn">Add entry</button>
+            <button type="button" class="btn-icon hidden" id="manual-att-cancel-btn">Cancel edit</button>
+          </div>
+        </form>
+        <div class="panel-sub" style="margin-top:6px;">Leave a whole day out of time in/out and pick a status (e.g. Paid Leave) instead — hours are left at 0 for those days.</div>
+
+        <div class="panel-sub" style="margin-top:20px; margin-bottom:6px;">Entries are never deleted by switching periods — this only filters which ones are listed below. Defaults to the selected period's cutoff dates; widen it to review entries from other cutoffs.</div>
+        <div class="form-grid" style="grid-template-columns: 1fr 1fr; gap:12px;">
+          <div class="field">
+            <label for="manual-att-filter-from">Cutoff filter — from</label>
+            <input type="date" id="manual-att-filter-from" style="width:100%; padding:8px 10px; border:1px solid var(--line); font-family:inherit; font-size:13px;">
+          </div>
+          <div class="field">
+            <label for="manual-att-filter-to">Cutoff filter — to</label>
+            <input type="date" id="manual-att-filter-to" style="width:100%; padding:8px 10px; border:1px solid var(--line); font-family:inherit; font-size:13px;">
+          </div>
+        </div>
+
+        <div style="overflow-x:auto; margin-top:12px;">
+        <table>
+          <thead><tr>
+            <th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th><th>Status</th><th>Actions</th>
+          </tr></thead>
+          <tbody id="manual-att-tbody"><tr><td colspan="6" class="empty">Select a payroll period and cutoff filter above.</td></tr></tbody>
+        </table>
+        </div>
+      </div>
+      </div>
       </div>
     </section>
     <section id="view-processing" class="view hidden">
