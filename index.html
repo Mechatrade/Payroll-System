@@ -77,6 +77,7 @@
       loadDashboard();
       loadPeriods();
       loadEmployeesForProcessing();
+      loadHolidays();
     }
   });
 
@@ -188,6 +189,7 @@
     document.getElementById('manual-att-cancel-btn').addEventListener('click', exitManualAttEditMode);
     document.getElementById('manual-att-status').addEventListener('change', updateManualAttTimeRequirement);
     document.getElementById('att-period-select').addEventListener('change', () => loadManualEntries());
+    document.getElementById('holiday-form').addEventListener('submit', addHoliday);
     document.getElementById('manual-att-status').innerHTML = ATTENDANCE_STATUSES.map(s =>
       `<option value="${s.value}">${s.label}</option>`).join('');
     updateManualAttTimeRequirement();
@@ -367,12 +369,17 @@
     contributionMonth(period) {
       return period.cutoff_start ? period.cutoff_start.slice(0, 7) : null; // 'YYYY-MM'
     },
-    // A semi-monthly period is either the FIRST or SECOND cutoff of its month
-    // (day 1-15 = first, 16+ = second), determined by the cutoff's start date.
-    // A monthly period_type has only one cutoff, so it's always 'full'.
+    // A semi-monthly period is either the FIRST or SECOND cutoff of its month.
+    // Mechatrade's actual calendar: cutoff 1 runs ~29th of the PRIOR month
+    // through the 13th (payday the 15th); cutoff 2 runs the 14th through the
+    // 28th (payday the 30th). cutoff_start's day-of-month varies (27th/28th/
+    // 29th/30th depending on how long the prior month is), so it's an
+    // unreliable anchor — cutoff_end is consistently ~13th or ~28th, so
+    // position is determined from THAT instead. A monthly period_type has
+    // only one cutoff, so it's always 'full'.
     determineCutoffPosition(period) {
       if (period.period_type === 'monthly') return 'full';
-      const day = new Date(period.cutoff_start + 'T00:00:00').getDate();
+      const day = new Date(period.cutoff_end + 'T00:00:00Z').getUTCDate();
       return day <= 15 ? 'first' : 'second';
     },
     // Confirmed rule: employee statutory deduction is 0 on the first cutoff
@@ -428,28 +435,158 @@
       return Math.round(Math.max(tax, 0) * 100) / 100;
     },
 
+    // ---- DOLE day-type pay premiums (Labor Code Arts. 87-94 + annual holiday
+    // pay Labor Advisories) ----
+    // Multiplier on the DAILY rate for a worked day of this type.
+    DAY_TYPE_WORKED_MULTIPLIER: {
+      regular: 1.0,
+      rest_day: 1.30,
+      special_non_working: 1.30,
+      special_rest_day: 1.50,
+      regular_holiday: 2.00,
+      regular_holiday_rest_day: 2.60,
+      double_holiday: 3.00,
+      // Not explicitly spelled out in every advisory — extrapolated
+      // consistently with the rest-day stacking pattern (300% x 130%).
+      // Confirm against that year's specific advisory if this combo comes up.
+      double_holiday_rest_day: 3.90
+    },
+    // Extra multiplier on the hourly rate for OT hours on that day type —
+    // stacks the day's worked multiplier with the OT premium (130% for rest/
+    // special days, +30% on the holiday rate for holidays).
+    DAY_TYPE_OT_MULTIPLIER: {
+      regular: 1.25,
+      rest_day: 1.30 * 1.30,
+      special_non_working: 1.30 * 1.30,
+      special_rest_day: 1.50 * 1.30,
+      regular_holiday: 2.00 * 1.30,
+      regular_holiday_rest_day: 2.60 * 1.30,
+      double_holiday: 3.00 * 1.30,
+      double_holiday_rest_day: 3.90 * 1.30
+    },
+    // Minutes of [startDate, endDate) that fall inside the 10PM-6AM PH
+    // window — computed on PH wall-clock time (UTC+8, no DST) regardless of
+    // the browser's own timezone, and correct across a shift that crosses
+    // midnight or spans multiple nights.
+    nightShiftMinutes(startDate, endDate) {
+      const OFFSET = 8 * 3600 * 1000;
+      const s = startDate.getTime() + OFFSET;
+      const e = endDate.getTime() + OFFSET;
+      let total = 0;
+      let dayStart = Math.floor(s / 86400000) * 86400000;
+      while (dayStart < e) {
+        const nightStart = dayStart + 22 * 3600000;
+        const nightEnd = dayStart + 30 * 3600000;
+        const overlapStart = Math.max(s, nightStart);
+        const overlapEnd = Math.min(e, nightEnd);
+        if (overlapEnd > overlapStart) total += (overlapEnd - overlapStart) / 60000;
+        dayStart += 86400000;
+      }
+      return Math.round(total);
+    },
+    // Aggregates one employee's saved attendance days for a period into the
+    // three DOLE premium totals Payroll Processing pre-fills from: holiday
+    // pay, rest-day pay, and night shift differential. OT itself is handled
+    // separately via a blended multiplier (see otMultiplierForDays below) so
+    // the existing "OT hours" input stays editable and meaningful.
+    //
+    // Daily-rate vs monthly-rate distinction: a daily-rate employee's basic
+    // pay already counts a worked special day as 1 payable day (100%), so
+    // only the PREMIUM portion (multiplier − 1) is added here. A monthly-
+    // rate employee's salary doesn't cover rest days or special days at all,
+    // so a worked one adds the FULL amount — except worked regular/double
+    // holidays, which are conventionally deemed already included in monthly
+    // salary, so only the premium portion is added there too. Unworked
+    // holidays add nothing extra for monthly staff (already salaried) and
+    // are covered via the payable-days count for daily staff.
+    computeSpecialDayPay(days, employee, divisor = 26) {
+      const dailyRate = this.getDailyRateEquivalent(employee, divisor);
+      const hourlyRate = dailyRate / 8;
+      const isMonthly = employee.rate_type === 'monthly';
+      let holidayPay = 0, restDayPay = 0, nsdPay = 0;
+
+      (days || []).forEach(d => {
+        const dayType = d.day_type || 'regular';
+        const worked = !d.is_leave;
+        const regMin = Math.round((d.regular_hours || 0) * 60);
+        const otMin = Math.round((d.ot_hours || 0) * 60);
+        const nightMin = d.night_minutes || 0;
+        const workedMult = this.DAY_TYPE_WORKED_MULTIPLIER[dayType] ?? 1;
+        const otMult = this.DAY_TYPE_OT_MULTIPLIER[dayType] ?? 1.25;
+        const isHolidayType = dayType.startsWith('regular_holiday') || dayType.startsWith('double_holiday');
+        const isRestOrSpecialType = dayType === 'rest_day' || dayType === 'special_non_working' || dayType === 'special_rest_day';
+
+        if (worked && (isHolidayType || isRestOrSpecialType)) {
+          const premiumOnly = dailyRate * (workedMult - 1);
+          const fullAmount = dailyRate * workedMult;
+          const amount = isMonthly ? (isHolidayType ? premiumOnly : fullAmount) : premiumOnly;
+          if (isHolidayType) holidayPay += amount; else restDayPay += amount;
+        }
+        // Unworked regular/double holiday (attendance_status HOLIDAY_PAID):
+        // daily-rate gets it via the payable-days count already; monthly-
+        // rate is deemed already covered by salary. Nothing added here.
+
+        // Night differential — 10% of whichever rate applied to those
+        // specific minutes, split between the regular/OT buckets assuming
+        // regular hours are worked first chronologically.
+        const nightInRegular = Math.min(nightMin, regMin);
+        const nightInOT = Math.max(Math.min(nightMin, regMin + otMin) - regMin, 0);
+        nsdPay += (nightInRegular / 60) * hourlyRate * workedMult * 0.10
+                + (nightInOT / 60) * hourlyRate * otMult * 0.10;
+      });
+
+      return {
+        holidayPay: Math.round(holidayPay * 100) / 100,
+        restDayPay: Math.round(restDayPay * 100) / 100,
+        nsdPay: Math.round(nsdPay * 100) / 100
+      };
+    },
+    // Blended OT multiplier across all of a period's saved attendance days —
+    // lets the "OT hours" input stay a single editable number while still
+    // reflecting correct DOLE stacking (a rest-day or holiday OT hour costs
+    // more than an ordinary one) instead of a flat 125% for everything.
+    // Falls back to plain 125% when there's no attendance data to blend from.
+    otMultiplierForDays(days, employee, divisor = 26) {
+      const hourlyRate = this.getDailyRateEquivalent(employee, divisor) / 8;
+      let totalOtHours = 0, totalOtPay = 0;
+      (days || []).forEach(d => {
+        const otHours = d.ot_hours || 0;
+        if (!otHours) return;
+        const otMult = this.DAY_TYPE_OT_MULTIPLIER[d.day_type || 'regular'] ?? 1.25;
+        totalOtHours += otHours;
+        totalOtPay += otHours * hourlyRate * otMult;
+      });
+      if (totalOtHours <= 0) return 1.25;
+      return totalOtPay / (totalOtHours * hourlyRate);
+    },
+
     // Full record for one employee in one payroll period.
-    // inputs (monthly-rate): { otHours, holidayPay, otherEarnings, unpaidDays, otherDeductions }
-    // inputs (daily-rate):   { otHours, holidayPay, otherEarnings, restDayPay, payableDays, otherDeductions }
+    // inputs (monthly-rate): { otHours, otMultiplier, holidayPay, restDayPay, nsdPay, otherEarnings, unpaidDays, otherDeductions }
+    // inputs (daily-rate):   { otHours, otMultiplier, holidayPay, restDayPay, nsdPay, otherEarnings, payableDays, otherDeductions }
+    // otMultiplier: blended DOLE-stacked OT rate from otMultiplierForDays() — defaults to plain 125% (Art. 87) when not supplied.
     // taxPeriodFactor: 1 for a monthly cutoff, 0.5 for semi-monthly (tax withholding still splits evenly per cutoff — only SSS/PhilHealth/Pag-IBIG follow the first/second-cutoff rule).
     computeRecord(employee, inputs, period, taxPeriodFactor = 0.5, divisor = 26) {
-      const ot = this.overtimePay(employee, inputs.otHours || 0, divisor);
+      const ot = this.overtimePay(employee, inputs.otHours || 0, divisor, 8, inputs.otMultiplier || 1.25);
       const holidayPay = inputs.holidayPay || 0;
+      const restDayPay = inputs.restDayPay || 0;
+      const nsdPay = inputs.nsdPay || 0;
       const otherEarnings = inputs.otherEarnings || 0;
       const otherDeductions = inputs.otherDeductions || 0;
 
-      let basic, gross, unpaidDeduction = 0, restDayPay = 0;
+      let basic, unpaidDeduction = 0;
       if (employee.rate_type === 'monthly') {
         const semiMonthlyBase = employee.rate_amount / 2;
         const dailyEquivalent = employee.rate_amount / divisor;
         unpaidDeduction = (inputs.unpaidDays || 0) * dailyEquivalent;
         basic = semiMonthlyBase;
-        gross = semiMonthlyBase - unpaidDeduction + ot + holidayPay + otherEarnings;
       } else {
-        restDayPay = inputs.restDayPay || 0;
         basic = employee.rate_amount * (inputs.payableDays || 0);
-        gross = basic + ot + holidayPay + restDayPay + otherEarnings;
       }
+      // Rest-day pay and NSD apply the same way regardless of rate type —
+      // a monthly-rate employee's salary doesn't cover a worked rest day
+      // any more than a daily-rate one's does. See computeSpecialDayPay for
+      // how these amounts get pre-filled.
+      let gross = basic - unpaidDeduction + ot + holidayPay + restDayPay + nsdPay + otherEarnings;
 
       // Actual basic pay earned THIS cutoff, net of unpaid days — not the
       // `basic` above, which for monthly-rate employees is still the nominal
@@ -483,7 +620,7 @@
       const needsReview = grossRaw < 0 || netRaw < 0;
 
       return {
-        basic, ot, holidayPay, restDayPay, otherEarnings,
+        basic, ot, holidayPay, restDayPay, nsdPay, otherEarnings,
         unpaidDeduction,
         gross, grossRaw, sss, sssEmployer, sssEC, philhealth, philhealthEmployer, pagibig, pagibigEmployer, tax,
         otherDeductions, totalDeductions, net, netRaw, needsReview,
@@ -512,7 +649,8 @@
     { value: 'PAID_LEAVE', label: 'Paid Leave' },
     { value: 'UNPAID_LEAVE', label: 'Unpaid Leave' },
     { value: 'EMERGENCY_LEAVE', label: 'Emergency Leave' },
-    { value: 'HALF_DAY', label: 'Half Day' }
+    { value: 'HALF_DAY', label: 'Half Day' },
+    { value: 'HOLIDAY_PAID', label: 'Holiday (paid, not worked)' }
   ];
 
   let pulledDays = null; // array of { employeeId, employeeName, date, timeIn, timeOut, regularHours, otHours, undertimeMinutes, isLeave, attendanceStatus }
@@ -538,6 +676,72 @@
   function isWeekend(dateKey) {
     const dow = new Date(dateKey + 'T00:00:00Z').getUTCDay();
     return dow === 0 || dow === 6;
+  }
+
+  // ---------- Holiday calendar (DOLE regular holidays / special non-working days) ----------
+  const HOLIDAY_TYPE_LABELS = {
+    regular: 'Regular Holiday',
+    special_non_working: 'Special (Non-working) Day',
+    double: 'Double Holiday'
+  };
+  let holidaysCache = [];
+  let holidaysByDate = {}; // dateKey -> { type, label }
+
+  function loadHolidays() {
+    const q = query(collection(db, 'holidays'), orderBy('date'));
+    onSnapshot(q, (snap) => {
+      holidaysCache = [];
+      holidaysByDate = {};
+      snap.forEach(d => {
+        const data = { id: d.id, ...d.data() };
+        holidaysCache.push(data);
+        holidaysByDate[data.date] = { type: data.type, label: data.label || '' };
+      });
+      renderHolidaysTable();
+    });
+  }
+
+  function renderHolidaysTable() {
+    const tbody = document.getElementById('holidays-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = holidaysCache.map(h => `
+      <tr>
+        <td>${h.date}</td>
+        <td>${HOLIDAY_TYPE_LABELS[h.type] || h.type}</td>
+        <td>${h.label || '—'}</td>
+        <td><button class="btn-icon" onclick='__mpDeleteHoliday("${h.id}")'>Delete</button></td>
+      </tr>`).join('') || '<tr><td colspan="4" class="empty">No holidays declared yet.</td></tr>';
+  }
+
+  async function addHoliday(e) {
+    e.preventDefault();
+    const date = document.getElementById('holiday-date').value;
+    const type = document.getElementById('holiday-type').value;
+    const label = document.getElementById('holiday-label').value.trim();
+    if (!date) return;
+    // Doc id = the date itself, so re-declaring the same date just updates it.
+    await setDoc(doc(db, 'holidays', date), { date, type, label, updated_at: serverTimestamp() });
+    e.target.reset();
+  }
+
+  window.__mpDeleteHoliday = async (id) => {
+    if (!confirm('Remove this holiday from the calendar?')) return;
+    await deleteDoc(doc(db, 'holidays', id));
+  };
+
+  // Classifies a calendar date into the DOLE day-type categories used for pay
+  // premium computation, combining the holiday calendar with the Mon–Fri
+  // office schedule (Sat/Sun = rest day for everyone, since per-employee rest
+  // days aren't tracked separately).
+  function classifyDay(dateKey) {
+    const h = holidaysByDate[dateKey];
+    const rest = isWeekend(dateKey);
+    if (h) {
+      if (h.type === 'double') return rest ? 'double_holiday_rest_day' : 'double_holiday';
+      if (h.type === 'regular') return rest ? 'regular_holiday_rest_day' : 'regular_holiday';
+      if (h.type === 'special_non_working') return rest ? 'special_rest_day' : 'special_non_working';
+    }
+    return rest ? 'rest_day' : 'regular';
   }
 
   function dateRangeInclusive(startStr, endStr) {
@@ -600,16 +804,18 @@
       const dates = dateRangeInclusive(period.cutoff_start, period.cutoff_end);
       const activeEmployees = employeesCache.filter(e => e.status === 'active' && e.email);
       const rows = [];
-      // Weekend dates with no actual work — these should NOT count as leave/
-      // absence (office is Mon–Fri), so they're excluded from `rows` entirely
-      // rather than defaulted to Unpaid Leave. Tracked separately so save can
-      // clean up any such records a previous pull/save may have already
-      // written before this rule existed.
+      // Rest days / special non-working days with no actual work — these
+      // should NOT count as leave/absence ("no work, no pay" days that were
+      // never scheduled to begin with), so they're excluded from `rows`
+      // entirely rather than defaulted to Unpaid Leave. Tracked separately
+      // so save can clean up any such records a previous pull/save may have
+      // already written before this rule existed.
       const weekendNonWorkDays = [];
 
       activeEmployees.forEach(emp => {
         const email = emp.email.toLowerCase();
         dates.forEach(dateKey => {
+          const dayType = classifyDay(dateKey);
           const entry = byEmailDate[email] && byEmailDate[email][dateKey];
           if (entry) {
             // Only assume an unpaid lunch was taken (and deduct 1hr) when the
@@ -622,11 +828,14 @@
             const regularMinutes = Math.min(workedMinutes, 8 * 60);
             const otMinutes = Math.max(workedMinutes - 8 * 60, 0);
             const undertimeMinutes = Math.max(8 * 60 - workedMinutes, 0);
+            const nightMinutes = window.__mpCalc.nightShiftMinutes(entry.earliestStart, entry.latestEnd);
             // Auto-classify: ~4 worked hours reads as a half day; anything
             // else with actual time in/out (including a full 8hrs) reads as
             // Present. Admin can still override via the dropdown. This
-            // applies on weekends too — if someone actually worked a
-            // Saturday/Sunday, it's still a paid worked day.
+            // applies on weekends/holidays too — if someone actually worked
+            // a rest day or holiday, it's still a paid worked day, and the
+            // holiday/rest-day premium is computed automatically from
+            // `dayType` in Payroll Processing.
             const autoStatus = (workedMinutes >= 180 && workedMinutes <= 300) ? 'HALF_DAY' : 'PRESENT';
             rows.push({
               employeeId: emp.id, employeeName: emp.name, date: dateKey,
@@ -635,15 +844,28 @@
               otHours: Math.round((otMinutes / 60) * 100) / 100,
               lateMinutes: 0,
               undertimeMinutes: Math.round(undertimeMinutes),
-              isLeave: false, attendanceStatus: autoStatus
+              nightMinutes,
+              isLeave: false, attendanceStatus: autoStatus, dayType
             });
-          } else if (isWeekend(dateKey)) {
+          } else if (dayType === 'rest_day' || dayType === 'special_non_working' || dayType === 'special_rest_day') {
             weekendNonWorkDays.push({ employeeId: emp.id, date: dateKey });
+          } else if (dayType === 'regular_holiday' || dayType === 'regular_holiday_rest_day' || dayType === 'double_holiday' || dayType === 'double_holiday_rest_day') {
+            // Unworked but DOLE-paid holiday — not an absence, not a manual
+            // leave choice. Daily-rate staff get it via the payable-days
+            // count (is_leave: false); monthly-rate staff are deemed already
+            // covered by salary (computeSpecialDayPay adds nothing extra).
+            rows.push({
+              employeeId: emp.id, employeeName: emp.name, date: dateKey,
+              timeIn: null, timeOut: null, regularHours: 0, otHours: 0,
+              lateMinutes: 0, undertimeMinutes: 0, nightMinutes: 0,
+              isLeave: false, attendanceStatus: 'HOLIDAY_PAID', dayType
+            });
           } else {
             rows.push({
               employeeId: emp.id, employeeName: emp.name, date: dateKey,
               timeIn: null, timeOut: null, regularHours: 0, otHours: 0,
-              lateMinutes: 0, undertimeMinutes: 0, isLeave: true, attendanceStatus: 'UNPAID_LEAVE'
+              lateMinutes: 0, undertimeMinutes: 0, nightMinutes: 0,
+              isLeave: true, attendanceStatus: 'UNPAID_LEAVE', dayType
             });
           }
         });
@@ -763,6 +985,8 @@
         ot_hours: r.otHours,
         late_minutes: r.lateMinutes,
         undertime_minutes: r.undertimeMinutes,
+        night_minutes: r.nightMinutes || 0,
+        day_type: r.dayType || 'regular',
         is_leave: r.isLeave,
         attendance_status: r.attendanceStatus || null,
         source: 'pulsetime',
@@ -821,6 +1045,7 @@
       regularHours: Math.round((regularMinutes / 60) * 100) / 100,
       otHours: Math.round((otMinutes / 60) * 100) / 100,
       undertimeMinutes: Math.round(undertimeMinutes),
+      nightMinutes: window.__mpCalc.nightShiftMinutes(start, end),
       workedMinutes
     };
   }
@@ -861,7 +1086,8 @@
     }
 
     const computed = computeManualHours(date, timeInStr, timeOutStr);
-    let isLeave, regularHours = 0, otHours = 0, undertimeMinutes = 0, timeInISO = null, timeOutISO = null;
+    let isLeave, regularHours = 0, otHours = 0, undertimeMinutes = 0, timeInISO = null, timeOutISO = null, nightMinutes = 0;
+    const dayType = classifyDay(date);
 
     if (computed) {
       isLeave = false;
@@ -870,6 +1096,7 @@
       undertimeMinutes = computed.undertimeMinutes;
       timeInISO = computed.timeInISO;
       timeOutISO = computed.timeOutISO;
+      nightMinutes = computed.nightMinutes;
       if (!status) status = (computed.workedMinutes >= 180 && computed.workedMinutes <= 300) ? 'HALF_DAY' : 'PRESENT';
     } else {
       isLeave = true;
@@ -893,6 +1120,8 @@
         ot_hours: otHours,
         late_minutes: 0,
         undertime_minutes: undertimeMinutes,
+        night_minutes: nightMinutes,
+        day_type: dayType,
         is_leave: isLeave,
         attendance_status: status || null,
         source: 'manual',
@@ -1020,6 +1249,7 @@
         total_hours: Math.round(totalHours * 100) / 100,
         ot_hours: Math.round(otHours * 100) / 100,
         undertime_minutes: undertimeMinutes,
+        days, // raw day records — used by computeSpecialDayPay/otMultiplierForDays for DOLE premium computation
         source: 'pulsetime'
       };
     } catch { return null; }
@@ -1106,12 +1336,16 @@
       const snap = snapshots[emp.id];
       const unpaidDays = snap ? snap.unpaid_days : 0;
       const ot = snap ? snap.ot_hours : 0;
+      const premium = snap ? window.__mpCalc.computeSpecialDayPay(snap.days, emp, 26) : { holidayPay: 0, restDayPay: 0, nsdPay: 0 };
+      const otMultiplier = snap ? window.__mpCalc.otMultiplierForDays(snap.days, emp, 26) : 1.25;
       return `
-        <tr data-emp-id="${emp.id}" data-rate-type="monthly">
+        <tr data-emp-id="${emp.id}" data-rate-type="monthly" data-ot-multiplier="${otMultiplier}">
           <td>${emp.name}<div style="font-size:11px;color:var(--muted);">₱${emp.rate_amount}/mo${snap ? ' · from attendance records' : ''}</div></td>
           <td><input type="number" class="cell-input" data-field="unpaidDays" value="${unpaidDays}" min="0" step="0.5" style="width:56px;"></td>
           <td><input type="number" class="cell-input" data-field="otHours" value="${ot}" min="0" step="0.5" style="width:56px;"></td>
-          <td><input type="number" class="cell-input" data-field="holidayPay" value="0" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="holidayPay" value="${premium.holidayPay}" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="restDayPay" value="${premium.restDayPay}" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="nsdPay" value="${premium.nsdPay}" min="0" step="0.01" style="width:70px;"></td>
           <td><input type="number" class="cell-input" data-field="otherEarnings" value="0" min="0" step="0.01" style="width:70px;"></td>
           <td class="num result-gross">—</td>
           <td class="num result-deductions">—</td>
@@ -1123,13 +1357,16 @@
       const snap = snapshots[emp.id];
       const days = snap ? snap.days_present : 13;
       const ot = snap ? snap.ot_hours : 0;
+      const premium = snap ? window.__mpCalc.computeSpecialDayPay(snap.days, emp, 26) : { holidayPay: 0, restDayPay: 0, nsdPay: 0 };
+      const otMultiplier = snap ? window.__mpCalc.otMultiplierForDays(snap.days, emp, 26) : 1.25;
       return `
-        <tr data-emp-id="${emp.id}" data-rate-type="daily">
+        <tr data-emp-id="${emp.id}" data-rate-type="daily" data-ot-multiplier="${otMultiplier}">
           <td>${emp.name}<div style="font-size:11px;color:var(--muted);">₱${emp.rate_amount}/day${snap ? ' · from attendance records' : ''}</div></td>
           <td><input type="number" class="cell-input" data-field="payableDays" value="${days}" min="0" step="0.5" style="width:56px;"></td>
           <td><input type="number" class="cell-input" data-field="otHours" value="${ot}" min="0" step="0.5" style="width:56px;"></td>
-          <td><input type="number" class="cell-input" data-field="holidayPay" value="0" min="0" step="0.01" style="width:70px;"></td>
-          <td><input type="number" class="cell-input" data-field="restDayPay" value="0" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="holidayPay" value="${premium.holidayPay}" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="restDayPay" value="${premium.restDayPay}" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="nsdPay" value="${premium.nsdPay}" min="0" step="0.01" style="width:70px;"></td>
           <td><input type="number" class="cell-input" data-field="otherEarnings" value="0" min="0" step="0.01" style="width:70px;"></td>
           <td class="num result-gross">—</td>
           <td class="num result-deductions">—</td>
@@ -1137,8 +1374,8 @@
         </tr>`;
     }).join('');
 
-    document.getElementById('processing-tbody-monthly').innerHTML = monthlyRows || `<tr><td colspan="9" class="empty">No active monthly-rate employees.</td></tr>`;
-    document.getElementById('processing-tbody-daily').innerHTML = dailyRows || `<tr><td colspan="9" class="empty">No active daily-rate employees.</td></tr>`;
+    document.getElementById('processing-tbody-monthly').innerHTML = monthlyRows || `<tr><td colspan="10" class="empty">No active monthly-rate employees.</td></tr>`;
+    document.getElementById('processing-tbody-daily').innerHTML = dailyRows || `<tr><td colspan="10" class="empty">No active daily-rate employees.</td></tr>`;
 
     document.querySelectorAll('#processing-tbody-monthly .cell-input, #processing-tbody-daily .cell-input')
       .forEach(inp => inp.addEventListener('input', () => recomputeRow(inp.closest('tr'), period, taxFactor)));
@@ -1151,15 +1388,18 @@
     const emp = employeesCache.find(e => e.id === empId);
     if (!emp || !period) return;
     const val = (field) => parseFloat(tr.querySelector(`[data-field="${field}"]`)?.value || 0);
+    const otMultiplier = parseFloat(tr.dataset.otMultiplier) || 1.25;
 
     const inputs = emp.rate_type === 'monthly'
       ? {
-          unpaidDays: val('unpaidDays'),
-          otHours: val('otHours'), holidayPay: val('holidayPay'), otherEarnings: val('otherEarnings')
+          unpaidDays: val('unpaidDays'), otHours: val('otHours'), otMultiplier,
+          holidayPay: val('holidayPay'), restDayPay: val('restDayPay'), nsdPay: val('nsdPay'),
+          otherEarnings: val('otherEarnings')
         }
       : {
-          payableDays: val('payableDays'), otHours: val('otHours'),
-          holidayPay: val('holidayPay'), restDayPay: val('restDayPay'), otherEarnings: val('otherEarnings')
+          payableDays: val('payableDays'), otHours: val('otHours'), otMultiplier,
+          holidayPay: val('holidayPay'), restDayPay: val('restDayPay'), nsdPay: val('nsdPay'),
+          otherEarnings: val('otherEarnings')
         };
 
     const rec = window.__mpCalc.computeRecord(emp, inputs, period, taxFactor);
@@ -1337,6 +1577,8 @@
           line('Semi-monthly base (Monthly ÷ 2)', rec.basic),
           line('Overtime pay', rec.ot),
           line('Holiday pay', rec.holidayPay),
+          line('Rest day pay', rec.restDayPay),
+          line('Night shift differential', rec.nsdPay),
           line('Other earnings', rec.otherEarnings)
         ].join('')
       : [
@@ -1344,6 +1586,7 @@
           line('Overtime pay', rec.ot),
           line('Holiday pay', rec.holidayPay),
           line('Rest day pay', rec.restDayPay),
+          line('Night shift differential', rec.nsdPay),
           line('Other earnings', rec.otherEarnings)
         ].join('');
 
@@ -2125,6 +2368,7 @@
     <button class="nav-item active" data-target="view-dashboard">Dashboard</button>
     <button class="nav-item" data-target="view-employees">Employees</button>
     <button class="nav-item" data-target="view-attendance">Attendance</button>
+    <button class="nav-item" data-target="view-holidays">Holidays</button>
     <button class="nav-item" data-target="view-processing">Payroll Processing</button>
     <button class="nav-item" data-target="view-approval">Approval</button>
     <button class="nav-item" data-target="view-payslip">Payslips</button>
@@ -2327,6 +2571,40 @@
       </div>
       </div>
     </section>
+    <section id="view-holidays" class="view hidden">
+      <div class="panel">
+        <h3>Holiday calendar</h3>
+        <div class="panel-sub">Declares which dates are Regular Holidays, Special (Non-working) Days, or Double Holidays (two regular holidays coinciding). Feeds automatic holiday/rest-day pay computation in Attendance and Payroll Processing — add dates as they're proclaimed for the year.</div>
+        <form id="holiday-form" class="form-grid" style="grid-template-columns: 1fr 1.2fr 1.4fr; align-items: end;">
+          <div class="field">
+            <label for="holiday-date">Date</label>
+            <input type="date" id="holiday-date" required>
+          </div>
+          <div class="field">
+            <label for="holiday-type">Type</label>
+            <select id="holiday-type" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;">
+              <option value="regular">Regular Holiday</option>
+              <option value="special_non_working">Special (Non-working) Day</option>
+              <option value="double">Double Holiday</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="holiday-label">Label</label>
+            <input type="text" id="holiday-label" placeholder="e.g. National Heroes Day">
+          </div>
+          <div style="grid-column: 1 / -1;">
+            <button type="submit" class="btn-add">Add holiday</button>
+          </div>
+        </form>
+      </div>
+      <div class="panel">
+        <h3>Declared dates</h3>
+        <table>
+          <thead><tr><th>Date</th><th>Type</th><th>Label</th><th></th></tr></thead>
+          <tbody id="holidays-tbody"><tr><td colspan="4" class="empty">No holidays declared yet.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
     <section id="view-processing" class="view hidden">
       <div class="panel">
         <h3>New payroll period</h3>
@@ -2377,13 +2655,13 @@
         </div>
 
         <h3 style="font-size:14px; margin-top:24px; margin-bottom:2px;">Monthly-rate employees</h3>
-        <div class="panel-sub" style="margin-bottom:12px;">Semi-monthly Base = Monthly Salary ÷ 2, minus Unpaid Days deduction, plus OT/Holiday/Other Earnings.</div>
+        <div class="panel-sub" style="margin-bottom:12px;">Semi-monthly Base = Monthly Salary ÷ 2, minus Unpaid Days deduction, plus OT/Holiday/Rest Day/NSD/Other Earnings. Holiday, rest day, and NSD pay are pre-filled from attendance using DOLE premium rates — override if needed.</div>
         <div style="overflow-x:auto;">
         <table>
           <thead>
             <tr>
               <th>Employee</th><th>Unpaid days</th><th>OT hours</th>
-              <th>Holiday pay (₱)</th><th>Other earnings (₱)</th>
+              <th>Holiday pay (₱)</th><th>Rest day pay (₱)</th><th>NSD pay (₱)</th><th>Other earnings (₱)</th>
               <th class="num">Gross</th><th class="num">Deductions</th><th class="num">Net pay</th>
             </tr>
           </thead>
@@ -2392,19 +2670,20 @@
         </div>
 
         <h3 style="font-size:14px; margin-top:28px; margin-bottom:2px;">Daily-rate employees</h3>
-        <div class="panel-sub" style="margin-bottom:12px;">Basic Pay = Daily Rate × Payable Days, plus OT/Holiday/Rest Day/Other Earnings.</div>
+        <div class="panel-sub" style="margin-bottom:12px;">Basic Pay = Daily Rate × Payable Days, plus OT/Holiday/Rest Day/NSD/Other Earnings. Holiday, rest day, and NSD pay are pre-filled from attendance using DOLE premium rates — override if needed.</div>
         <div style="overflow-x:auto;">
         <table>
           <thead>
             <tr>
               <th>Employee</th><th>Payable days</th><th>OT hours</th>
-              <th>Holiday pay (₱)</th><th>Rest day pay (₱)</th><th>Other earnings (₱)</th>
+              <th>Holiday pay (₱)</th><th>Rest day pay (₱)</th><th>NSD pay (₱)</th><th>Other earnings (₱)</th>
               <th class="num">Gross</th><th class="num">Deductions</th><th class="num">Net pay</th>
             </tr>
           </thead>
           <tbody id="processing-tbody-daily"></tbody>
         </table>
         </div>
+
 
         <div style="margin-top:18px;">
           <button class="btn-add" id="save-batch-btn">Save &amp; send for approval</button>
