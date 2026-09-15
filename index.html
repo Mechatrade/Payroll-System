@@ -340,11 +340,28 @@
       const hourlyRate = this.getDailyRateEquivalent(employee, divisor) / hoursPerDay;
       return hourlyRate * otHours * otMultiplier;
     },
-    // Monthly-equivalent compensation, used as the base for statutory contributions
-    // when an employee is paid on a daily rate (annualized to a monthly figure).
+    // Monthly-equivalent compensation. Kept for reference/other callers, but
+    // statutory contributions no longer use this directly — see actualMonthlyComp
+    // below for why.
     monthlyEquivalent(employee, divisor = 26, workingDaysPerMonth = 26) {
       if (employee.rate_type === 'monthly') return employee.rate_amount;
       return employee.rate_amount * workingDaysPerMonth;
+    },
+    // Statutory base: what the employee ACTUALLY earned this cutoff (basic pay,
+    // before OT/holiday/other add-ons), projected to a monthly figure the same
+    // way the period is normally annualized (×2 for semi-monthly, ×1 for a
+    // monthly-type cutoff which already spans the full month).
+    // Using the nominal contracted rate here (the old approach) overcharges
+    // SSS/PhilHealth/Pag-IBIG for anyone on extended unpaid leave — they'd be
+    // billed as if they earned a full month's pay when they actually earned
+    // close to ₱0, producing deductions that exceed gross pay.
+    // Caveat: on the second cutoff (where the full month's statutory amount
+    // posts), this only reflects the SECOND cutoff's actual earnings, not the
+    // sum of both cutoffs in the month — a reasonable approximation, but if the
+    // two cutoffs differ a lot in attendance it won't be exact either.
+    actualMonthlyComp(basicEarnedThisCutoff, period) {
+      const cutoffsPerMonth = period.period_type === 'monthly' ? 1 : 2;
+      return Math.max(basicEarnedThisCutoff, 0) * cutoffsPerMonth;
     },
 
     // ---- Statutory engine: Contribution Month → Monthly Compensation → SSS MSC → SSS/PhilHealth/Pag-IBIG → Employee/Employer shares ----
@@ -435,9 +452,17 @@
         gross = basic + ot + holidayPay + restDayPay + otherEarnings;
       }
 
-      const monthlyComp = this.monthlyEquivalent(employee, divisor);
+      // Actual basic pay earned THIS cutoff, net of unpaid days — not the
+      // `basic` above, which for monthly-rate employees is still the nominal
+      // half-month salary before the unpaid-days deduction is applied.
+      const basicEarned = Math.max(basic - unpaidDeduction, 0);
+      const monthlyComp = this.actualMonthlyComp(basicEarned, period);
       const cutoffPosition = this.determineCutoffPosition(period);
-      const statutoryMultiplier = this.statutoryCutoffMultiplier(period);
+      // No compensation earned this cutoff (e.g. a full unpaid-leave cutoff)
+      // → no statutory contribution is due, full stop. Without this, SSS/
+      // PhilHealth's own minimum-base floors (₱5,000 MSC / ₱10,000 income)
+      // would still charge a baseline deduction against ₱0 of actual pay.
+      const statutoryMultiplier = basicEarned <= 0 ? 0 : this.statutoryCutoffMultiplier(period);
 
       const sss = this.sssEmployeeShare(monthlyComp) * statutoryMultiplier;
       const sssEmployer = this.sssEmployerShare(monthlyComp) * statutoryMultiplier;
@@ -449,7 +474,7 @@
 
       // Withholding tax keeps the existing per-cutoff split (unaffected by the new SSS/PhilHealth/Pag-IBIG timing rule).
       const taxableIncome = Math.max(monthlyComp - (this.sssEmployeeShare(monthlyComp) + this.philhealthEmployeeShare(monthlyComp) + this.pagibigEmployeeShare(monthlyComp)), 0);
-      const tax = this.withholdingTax(taxableIncome) * taxPeriodFactor;
+      const tax = this.withholdingTax(taxableIncome) * taxPeriodFactor * (basicEarned <= 0 ? 0 : 1);
 
       const totalDeductions = sss + philhealth + pagibig + tax + otherDeductions;
       const grossRaw = gross;
@@ -494,13 +519,30 @@
   let pulledDays = null; // array of { employeeId, employeeName, date, timeIn, timeOut, regularHours, otHours, undertimeMinutes, isLeave, attendanceStatus }
   let pulledUnmatched = [];
 
+  // ---- Philippine-time (Asia/Manila, UTC+8, no DST) helpers ----
+  // PulseTime and payroll both operate on PH calendar days. Everything below
+  // is anchored explicitly to Asia/Manila so results don't depend on whatever
+  // timezone the admin's own browser/OS happens to be set to — without this,
+  // a daytime PH shift can render as a fabricated overnight shift (browser-
+  // local display formatting) or get filed under the wrong calendar day
+  // (naive UTC-based bucketing), even though the underlying instant is right.
+  function phDateKey(date) {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
+  }
+  function phTimeHHMM(date) {
+    return new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Manila', hour: '2-digit', minute: '2-digit', hour12: false }).format(date);
+  }
+
   function dateRangeInclusive(startStr, endStr) {
+    // Pure calendar-date arithmetic — anchored to UTC ('Z') so day-stepping
+    // never depends on the browser's local timezone (a local-midnight Date in
+    // an east-of-UTC zone like PH can otherwise roll back a calendar day).
     const dates = [];
-    let d = new Date(startStr + 'T00:00:00');
-    const end = new Date(endStr + 'T00:00:00');
+    let d = new Date(startStr + 'T00:00:00Z');
+    const end = new Date(endStr + 'T00:00:00Z');
     while (d <= end) {
       dates.push(d.toISOString().slice(0, 10));
-      d.setDate(d.getDate() + 1);
+      d.setUTCDate(d.getUTCDate() + 1);
     }
     return dates;
   }
@@ -517,15 +559,17 @@
 
     try {
       await ensureTimetrackerAuth();
-      const cutoffStart = new Date(period.cutoff_start + 'T00:00:00');
-      const cutoffEnd = new Date(period.cutoff_end + 'T23:59:59');
+      // Anchored to +08:00 explicitly — PH calendar-day boundaries, not
+      // whatever midnight the admin's browser timezone would compute.
+      const cutoffStart = new Date(period.cutoff_start + 'T00:00:00+08:00');
+      const cutoffEnd = new Date(period.cutoff_end + 'T23:59:59+08:00');
       // Single-field range filter on `start` — no composite index needed,
       // and this alone cuts reads down to just this cutoff's entries instead
       // of pulling PulseTime's entire history on every pull.
       const q = query(collection(dbTimetracker, 'tt_entries'),
         where('start', '>=', cutoffStart), where('start', '<=', cutoffEnd));
       const snap = await getDocs(q);
-      // byEmailDate[email][date] = { spanMinutes, earliestStart, latestEnd }
+      // byEmailDate[email][date] = { spanMinutes, earliestStart, latestEnd, sessionCount }
       const byEmailDate = {};
       const unmatchedEmails = new Set();
       snap.forEach(docSnap => {
@@ -535,11 +579,12 @@
         const end = d.end.toDate();
         if (start < cutoffStart || start > cutoffEnd) return;
         const email = d.ownerEmail.toLowerCase();
-        const dateKey = start.toISOString().slice(0, 10);
+        const dateKey = phDateKey(start); // PH calendar date, not raw UTC date
         if (!byEmailDate[email]) byEmailDate[email] = {};
-        if (!byEmailDate[email][dateKey]) byEmailDate[email][dateKey] = { spanMinutes: 0, earliestStart: start, latestEnd: end };
+        if (!byEmailDate[email][dateKey]) byEmailDate[email][dateKey] = { spanMinutes: 0, earliestStart: start, latestEnd: end, sessionCount: 0 };
         const bucket = byEmailDate[email][dateKey];
         bucket.spanMinutes += (end - start) / 60000;
+        bucket.sessionCount += 1;
         if (start < bucket.earliestStart) bucket.earliestStart = start;
         if (end > bucket.latestEnd) bucket.latestEnd = end;
         if (!employeesCache.find(e => (e.email || '').toLowerCase() === email)) unmatchedEmails.add(email);
@@ -554,7 +599,12 @@
         dates.forEach(dateKey => {
           const entry = byEmailDate[email] && byEmailDate[email][dateKey];
           if (entry) {
-            const lunchMinutes = entry.spanMinutes > 60 ? 60 : 0;
+            // Only assume an unpaid lunch was taken (and deduct 1hr) when the
+            // day is ONE continuous session over an hour — if there are 2+
+            // separate PulseTime sessions that day, the gap between them
+            // already represents the break, so deducting again would double-
+            // count it and understate hours actually worked.
+            const lunchMinutes = (entry.sessionCount === 1 && entry.spanMinutes > 60) ? 60 : 0;
             const workedMinutes = Math.max(entry.spanMinutes - lunchMinutes, 0);
             const regularMinutes = Math.min(workedMinutes, 8 * 60);
             const otMinutes = Math.max(workedMinutes - 8 * 60, 0);
@@ -598,7 +648,7 @@
     wrap.classList.remove('hidden');
     const statusOptions = (selected) => ATTENDANCE_STATUSES.map(s =>
       `<option value="${s.value}" ${s.value === selected ? 'selected' : ''}>${s.label}</option>`).join('');
-    const fmtTime = (iso) => iso ? new Date(iso).toLocaleString('en-PH', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—';
+    const fmtTime = (iso) => iso ? new Date(iso).toLocaleString('en-PH', { timeZone: 'Asia/Manila', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—';
 
     const byEmployee = {}; // employeeId -> { name, rows: [{r, idx}] }
     (pulledDays || []).forEach((r, idx) => {
@@ -730,8 +780,10 @@
   // any span over 60 minutes, 8 worked hours = a full regular day, the rest is OT.
   function computeManualHours(dateStr, timeInStr, timeOutStr) {
     if (!timeInStr || !timeOutStr) return null;
-    const start = new Date(`${dateStr}T${timeInStr}:00`);
-    let end = new Date(`${dateStr}T${timeOutStr}:00`);
+    // Explicit +08:00 anchor — the admin is entering a PH wall-clock time,
+    // not whatever timezone their own browser/OS happens to be set to.
+    const start = new Date(`${dateStr}T${timeInStr}:00+08:00`);
+    let end = new Date(`${dateStr}T${timeOutStr}:00+08:00`);
     if (end <= start) end = new Date(end.getTime() + 24 * 60 * 60 * 1000); // overnight shift
     const spanMinutes = (end - start) / 60000;
     const lunchMinutes = spanMinutes > 60 ? 60 : 0;
@@ -841,8 +893,8 @@
     manualAttEditingKey = docId;
     document.getElementById('manual-att-employee').value = row.employee_id;
     document.getElementById('manual-att-date').value = row.date;
-    document.getElementById('manual-att-timein').value = row.time_in ? new Date(row.time_in).toTimeString().slice(0, 5) : '';
-    document.getElementById('manual-att-timeout').value = row.time_out ? new Date(row.time_out).toTimeString().slice(0, 5) : '';
+    document.getElementById('manual-att-timein').value = row.time_in ? phTimeHHMM(new Date(row.time_in)) : '';
+    document.getElementById('manual-att-timeout').value = row.time_out ? phTimeHHMM(new Date(row.time_out)) : '';
     document.getElementById('manual-att-status').value = row.attendance_status || '';
     updateManualAttTimeRequirement();
     document.getElementById('manual-att-form-title').textContent = 'Edit manual entry';
@@ -880,7 +932,7 @@
     snap.forEach(d => manualEntriesCache.push({ id: d.id, ...d.data() }));
     manualEntriesCache.sort((a, b) => a.date.localeCompare(b.date) || (a.employee_id || '').localeCompare(b.employee_id || ''));
 
-    const fmtTime = (iso) => iso ? new Date(iso).toLocaleTimeString('en-PH', { hour: '2-digit', minute: '2-digit' }) : '—';
+    const fmtTime = (iso) => iso ? new Date(iso).toLocaleTimeString('en-PH', { timeZone: 'Asia/Manila', hour: '2-digit', minute: '2-digit' }) : '—';
     const statusLabel = (v) => (ATTENDANCE_STATUSES.find(s => s.value === v) || {}).label || '—';
 
     tbody.innerHTML = manualEntriesCache.map(r => {
@@ -1141,7 +1193,7 @@
           ${logoSrc ? `<img src="${logoSrc}" alt="Mechatrade">` : '<div></div>'}
           <div class="sheet-title">
             <h2>Payroll Register</h2>
-            <div>Generated ${new Date().toLocaleString('en-PH')}</div>
+            <div>Generated ${new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila' })}</div>
           </div>
         </div>
         <div class="sheet-meta">
@@ -1218,7 +1270,7 @@
       html: `
         <div class="sheet-header">
           ${logoSrc ? `<img src="${logoSrc}" alt="Mechatrade">` : '<div></div>'}
-          <div class="sheet-title"><h2>Payroll Register</h2><div>Generated ${new Date().toLocaleString('en-PH')}</div></div>
+          <div class="sheet-title"><h2>Payroll Register</h2><div>Generated ${new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila' })}</div></div>
         </div>
         <div class="sheet-meta">
           <div><span>Cutoff period</span>${period.cutoff_start} – ${period.cutoff_end}</div>
@@ -1278,7 +1330,7 @@
     return `
       <div class="sheet-header">
         ${logoSrc ? `<img src="${logoSrc}" alt="Mechatrade">` : '<div></div>'}
-        <div class="sheet-title"><h2>Payslip</h2><div>Generated ${new Date().toLocaleString('en-PH')}</div></div>
+        <div class="sheet-title"><h2>Payslip</h2><div>Generated ${new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila' })}</div></div>
       </div>
       <div class="sheet-meta">
         <div><span>Employee</span>${emp.name}</div>
