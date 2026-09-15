@@ -517,6 +517,7 @@
 
   let pulledDays = null; // array of { employeeId, employeeName, date, timeIn, timeOut, regularHours, otHours, undertimeMinutes, isLeave, attendanceStatus }
   let pulledUnmatched = [];
+  let pulledWeekendClears = []; // array of { employeeId, date } — unworked Sat/Sun days to purge from Firestore on save
 
   // ---- Philippine-time (Asia/Manila, UTC+8, no DST) helpers ----
   // PulseTime and payroll both operate on PH calendar days. Everything below
@@ -530,6 +531,13 @@
   }
   function phTimeHHMM(date) {
     return new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Manila', hour: '2-digit', minute: '2-digit', hour12: false }).format(date);
+  }
+  // Office schedule is Mon–Fri; a plain 'YYYY-MM-DD' dateKey parsed at UTC
+  // midnight gives a timezone-independent day-of-week (0=Sun..6=Sat) — same
+  // trick as dateRangeInclusive below.
+  function isWeekend(dateKey) {
+    const dow = new Date(dateKey + 'T00:00:00Z').getUTCDay();
+    return dow === 0 || dow === 6;
   }
 
   function dateRangeInclusive(startStr, endStr) {
@@ -592,6 +600,12 @@
       const dates = dateRangeInclusive(period.cutoff_start, period.cutoff_end);
       const activeEmployees = employeesCache.filter(e => e.status === 'active' && e.email);
       const rows = [];
+      // Weekend dates with no actual work — these should NOT count as leave/
+      // absence (office is Mon–Fri), so they're excluded from `rows` entirely
+      // rather than defaulted to Unpaid Leave. Tracked separately so save can
+      // clean up any such records a previous pull/save may have already
+      // written before this rule existed.
+      const weekendNonWorkDays = [];
 
       activeEmployees.forEach(emp => {
         const email = emp.email.toLowerCase();
@@ -610,7 +624,9 @@
             const undertimeMinutes = Math.max(8 * 60 - workedMinutes, 0);
             // Auto-classify: ~4 worked hours reads as a half day; anything
             // else with actual time in/out (including a full 8hrs) reads as
-            // Present. Admin can still override via the dropdown.
+            // Present. Admin can still override via the dropdown. This
+            // applies on weekends too — if someone actually worked a
+            // Saturday/Sunday, it's still a paid worked day.
             const autoStatus = (workedMinutes >= 180 && workedMinutes <= 300) ? 'HALF_DAY' : 'PRESENT';
             rows.push({
               employeeId: emp.id, employeeName: emp.name, date: dateKey,
@@ -621,6 +637,8 @@
               undertimeMinutes: Math.round(undertimeMinutes),
               isLeave: false, attendanceStatus: autoStatus
             });
+          } else if (isWeekend(dateKey)) {
+            weekendNonWorkDays.push({ employeeId: emp.id, date: dateKey });
           } else {
             rows.push({
               employeeId: emp.id, employeeName: emp.name, date: dateKey,
@@ -632,6 +650,7 @@
       });
 
       pulledDays = rows;
+      pulledWeekendClears = weekendNonWorkDays;
       pulledUnmatched = Array.from(unmatchedEmails);
       renderAttendanceSummary();
     } catch (err) {
@@ -749,6 +768,12 @@
         source: 'pulsetime',
         pulled_at: serverTimestamp()
       });
+    }
+    // Purge any unworked-weekend records a previous pull/save wrote before
+    // office days were restricted to Mon–Fri — harmless no-op if they were
+    // never saved in the first place.
+    for (const w of pulledWeekendClears) {
+      try { await deleteDoc(doc(db, 'attendance', `${periodId}_${w.employeeId}_${w.date}`)); } catch {}
     }
     btn.disabled = false;
     btn.textContent = 'Save to payroll attendance';
@@ -2228,7 +2253,7 @@
 
       <div class="panel hidden" id="attendance-summary-wrap">
         <h3>Pulled daily records</h3>
-        <div class="panel-sub">One row per employee per calendar day in the cutoff. Days with zero PulseTime entries auto-default to Unpaid Leave — change the dropdown per day if it was actually paid, emergency, or a half day. Late isn't auto-calculated (no fixed shift start time); Undertime is based on hours short of 8 worked (after a 1hr unpaid lunch on sessions over an hour).</div>
+        <div class="panel-sub">One row per employee per Mon–Fri workday in the cutoff (Saturdays/Sundays are excluded unless the employee actually worked that day, in which case it's shown and paid normally). Weekday rows with zero PulseTime entries auto-default to Unpaid Leave — change the dropdown per day if it was actually paid, emergency, or a half day. Late isn't auto-calculated (no fixed shift start time); Undertime is based on hours short of 8 worked (after a 1hr unpaid lunch on sessions over an hour).</div>
         <div style="overflow-x:auto;">
         <table>
           <thead><tr>
