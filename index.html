@@ -184,6 +184,13 @@
     });
     document.getElementById('pull-pulsetime-btn').addEventListener('click', pullFromPulseTime);
     document.getElementById('save-attendance-btn').addEventListener('click', saveAttendanceSnapshot);
+    document.getElementById('manual-att-form').addEventListener('submit', saveManualAttendance);
+    document.getElementById('manual-att-cancel-btn').addEventListener('click', exitManualAttEditMode);
+    document.getElementById('manual-att-status').addEventListener('change', updateManualAttTimeRequirement);
+    document.getElementById('att-period-select').addEventListener('change', () => loadManualEntries());
+    document.getElementById('manual-att-status').innerHTML = ATTENDANCE_STATUSES.map(s =>
+      `<option value="${s.value}">${s.label}</option>`).join('');
+    updateManualAttTimeRequirement();
     document.getElementById('preview-sheet-btn').addEventListener('click', openPayrollPreview);
     document.getElementById('close-preview-btn').addEventListener('click', closePayrollPreview);
     document.getElementById('print-sheet-btn').addEventListener('click', () => window.print());
@@ -285,6 +292,7 @@
       document.getElementById('stat-active-count').textContent = activeCount;
       document.getElementById('stat-daily-count').textContent = dailyCount;
       document.getElementById('stat-monthly-count').textContent = monthlyCount;
+      populateManualAttEmployeeSelect();
     });
   }
 
@@ -698,6 +706,200 @@
     alert('Attendance saved — ' + pulledDays.length + ' day records. Open this period in Payroll Processing to see it pre-filled.');
   }
 
+  // ---------- Manual attendance entry (employees not on PulseTime) ----------
+  // Same underlying `attendance` collection/document shape as the PulseTime pull
+  // (doc id `${periodId}_${employeeId}_${date}`) so Payroll Processing pre-fills
+  // from either source transparently. Tagged source:'manual' to distinguish it
+  // in the attendance list here; entering a manual record for a date that was
+  // already pulled from PulseTime overwrites that day's record (last write wins),
+  // which is the intended way to hand-correct a specific day.
+  let manualAttEditingKey = null; // doc id currently being edited, or null for a new entry
+
+  function populateManualAttEmployeeSelect() {
+    const sel = document.getElementById('manual-att-employee');
+    if (!sel) return;
+    const current = sel.value;
+    const active = employeesCache.filter(e => e.status === 'active');
+    sel.innerHTML = active.map(e =>
+      `<option value="${e.id}">${e.name}${e.email ? '' : ' — no PulseTime email on file'}</option>`
+    ).join('') || '<option value="">No active employees yet</option>';
+    if (current && active.find(e => e.id === current)) sel.value = current;
+  }
+
+  // Mirrors the PulseTime pull's hours math: 1hr unpaid lunch auto-deducted on
+  // any span over 60 minutes, 8 worked hours = a full regular day, the rest is OT.
+  function computeManualHours(dateStr, timeInStr, timeOutStr) {
+    if (!timeInStr || !timeOutStr) return null;
+    const start = new Date(`${dateStr}T${timeInStr}:00`);
+    let end = new Date(`${dateStr}T${timeOutStr}:00`);
+    if (end <= start) end = new Date(end.getTime() + 24 * 60 * 60 * 1000); // overnight shift
+    const spanMinutes = (end - start) / 60000;
+    const lunchMinutes = spanMinutes > 60 ? 60 : 0;
+    const workedMinutes = Math.max(spanMinutes - lunchMinutes, 0);
+    const regularMinutes = Math.min(workedMinutes, 8 * 60);
+    const otMinutes = Math.max(workedMinutes - 8 * 60, 0);
+    const undertimeMinutes = Math.max(8 * 60 - workedMinutes, 0);
+    return {
+      timeInISO: start.toISOString(),
+      timeOutISO: end.toISOString(),
+      regularHours: Math.round((regularMinutes / 60) * 100) / 100,
+      otHours: Math.round((otMinutes / 60) * 100) / 100,
+      undertimeMinutes: Math.round(undertimeMinutes),
+      workedMinutes
+    };
+  }
+
+  // Leave-type statuses don't need clock times; Present/Half Day are meant to
+  // be entered with actual time in/out, so toggle the inputs' requirement.
+  function updateManualAttTimeRequirement() {
+    const status = document.getElementById('manual-att-status').value;
+    const needsTimes = status === 'PRESENT' || status === '';
+    document.getElementById('manual-att-timein').required = needsTimes;
+    document.getElementById('manual-att-timeout').required = needsTimes;
+  }
+
+  async function saveManualAttendance(e) {
+    e.preventDefault();
+    const periodId = document.getElementById('att-period-select').value;
+    if (!periodId) { alert('Select a payroll period first (top of this page).'); return; }
+    const period = periodsCache.find(p => p.id === periodId);
+    if (!period) return;
+
+    const employeeId = document.getElementById('manual-att-employee').value;
+    const date = document.getElementById('manual-att-date').value;
+    const timeInStr = document.getElementById('manual-att-timein').value;
+    const timeOutStr = document.getElementById('manual-att-timeout').value;
+    let status = document.getElementById('manual-att-status').value;
+
+    if (!employeeId) { alert('Select an employee.'); return; }
+    if (!date) { alert('Select a date.'); return; }
+    if (date < period.cutoff_start || date > period.cutoff_end) {
+      alert(`That date is outside the selected period's cutoff (${period.cutoff_start} – ${period.cutoff_end}).`);
+      return;
+    }
+
+    const hasTimes = !!(timeInStr && timeOutStr);
+    if (!hasTimes && !status) {
+      alert('Either enter a time in/out, or choose an Attendance Status for a leave day.');
+      return;
+    }
+
+    const computed = computeManualHours(date, timeInStr, timeOutStr);
+    let isLeave, regularHours = 0, otHours = 0, undertimeMinutes = 0, timeInISO = null, timeOutISO = null;
+
+    if (computed) {
+      isLeave = false;
+      regularHours = computed.regularHours;
+      otHours = computed.otHours;
+      undertimeMinutes = computed.undertimeMinutes;
+      timeInISO = computed.timeInISO;
+      timeOutISO = computed.timeOutISO;
+      if (!status) status = (computed.workedMinutes >= 180 && computed.workedMinutes <= 300) ? 'HALF_DAY' : 'PRESENT';
+    } else {
+      isLeave = true;
+      // A leave status entered with no times — Half Day leave still zeroes hours here;
+      // admin can add a partial time in/out instead if they want it computed.
+    }
+
+    const employee = employeesCache.find(e => e.id === employeeId);
+    const docId = `${periodId}_${employeeId}_${date}`;
+    const btn = document.getElementById('manual-att-save-btn');
+    btn.disabled = true;
+    btn.textContent = 'Saving…';
+    try {
+      await setDoc(doc(db, 'attendance', docId), {
+        period_id: periodId,
+        employee_id: employeeId,
+        date,
+        time_in: timeInISO,
+        time_out: timeOutISO,
+        regular_hours: regularHours,
+        ot_hours: otHours,
+        late_minutes: 0,
+        undertime_minutes: undertimeMinutes,
+        is_leave: isLeave,
+        attendance_status: status || null,
+        source: 'manual',
+        pulled_at: serverTimestamp()
+      });
+      alert(`Saved manual entry for ${employee ? employee.name : 'employee'} on ${date}.` + (manualAttEditingKey ? '' : ' Open this period in Payroll Processing to see it reflected.'));
+      exitManualAttEditMode();
+      document.getElementById('manual-att-form').reset();
+      updateManualAttTimeRequirement();
+      await loadManualEntries();
+    } catch (err) {
+      alert('Could not save manual entry: ' + err.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = manualAttEditingKey ? 'Save changes' : 'Add entry';
+    }
+  }
+
+  window.__mpEditManualEntry = (docId) => {
+    const row = manualEntriesCache.find(r => r.id === docId);
+    if (!row) return;
+    manualAttEditingKey = docId;
+    document.getElementById('manual-att-employee').value = row.employee_id;
+    document.getElementById('manual-att-date').value = row.date;
+    document.getElementById('manual-att-timein').value = row.time_in ? new Date(row.time_in).toTimeString().slice(0, 5) : '';
+    document.getElementById('manual-att-timeout').value = row.time_out ? new Date(row.time_out).toTimeString().slice(0, 5) : '';
+    document.getElementById('manual-att-status').value = row.attendance_status || '';
+    updateManualAttTimeRequirement();
+    document.getElementById('manual-att-form-title').textContent = 'Edit manual entry';
+    document.getElementById('manual-att-save-btn').textContent = 'Save changes';
+    document.getElementById('manual-att-cancel-btn').classList.remove('hidden');
+    document.getElementById('manual-att-form').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
+  window.__mpDeleteManualEntry = async (docId) => {
+    if (!confirm('Delete this manual attendance entry?')) return;
+    await deleteDoc(doc(db, 'attendance', docId));
+    await loadManualEntries();
+  };
+
+  function exitManualAttEditMode() {
+    manualAttEditingKey = null;
+    document.getElementById('manual-att-form-title').textContent = 'Manual time entry';
+    document.getElementById('manual-att-save-btn').textContent = 'Add entry';
+    document.getElementById('manual-att-cancel-btn').classList.add('hidden');
+    document.getElementById('manual-att-form').reset();
+    updateManualAttTimeRequirement();
+  }
+
+  let manualEntriesCache = [];
+
+  async function loadManualEntries() {
+    const periodId = document.getElementById('att-period-select').value;
+    const tbody = document.getElementById('manual-att-tbody');
+    if (!tbody) return;
+    if (!periodId) { manualEntriesCache = []; tbody.innerHTML = `<tr><td colspan="6" class="empty">Select a payroll period above.</td></tr>`; return; }
+
+    const q = query(collection(db, 'attendance'), where('period_id', '==', periodId), where('source', '==', 'manual'));
+    const snap = await getDocs(q);
+    manualEntriesCache = [];
+    snap.forEach(d => manualEntriesCache.push({ id: d.id, ...d.data() }));
+    manualEntriesCache.sort((a, b) => a.date.localeCompare(b.date) || (a.employee_id || '').localeCompare(b.employee_id || ''));
+
+    const fmtTime = (iso) => iso ? new Date(iso).toLocaleTimeString('en-PH', { hour: '2-digit', minute: '2-digit' }) : '—';
+    const statusLabel = (v) => (ATTENDANCE_STATUSES.find(s => s.value === v) || {}).label || '—';
+
+    tbody.innerHTML = manualEntriesCache.map(r => {
+      const emp = employeesCache.find(e => e.id === r.employee_id);
+      return `
+        <tr>
+          <td>${emp ? emp.name : r.employee_id}</td>
+          <td style="color:var(--muted);">${r.date}</td>
+          <td>${fmtTime(r.time_in)}</td>
+          <td>${fmtTime(r.time_out)}</td>
+          <td>${statusLabel(r.attendance_status)}${r.is_leave ? ' <span class="tag" style="border-color:var(--red); color:var(--red);">Leave</span>' : ''}</td>
+          <td>
+            <button class="btn-icon" style="color:var(--navy);" onclick='__mpEditManualEntry("${r.id}")'>Edit</button>
+            <button class="btn-icon" style="margin-left:10px;" onclick='__mpDeleteManualEntry("${r.id}")'>Delete</button>
+          </td>
+        </tr>`;
+    }).join('') || `<tr><td colspan="6" class="empty">No manual entries for this period yet.</td></tr>`;
+  }
+
   // Aggregates the saved daily records for one employee/period into the
   // summary shape Payroll Processing pre-fills from (days present, OT, etc).
   async function getAttendanceSnapshot(periodId, employeeId) {
@@ -750,7 +952,10 @@
   function populateAttendancePeriodSelect() {
     const sel = document.getElementById('att-period-select');
     if (!sel) return;
+    const current = sel.value;
     sel.innerHTML = periodsCache.map(p => `<option value="${p.id}">${p.cutoff_start} – ${p.cutoff_end}</option>`).join('') || '<option value="">No periods yet</option>';
+    if (current && periodsCache.find(p => p.id === current)) sel.value = current;
+    loadManualEntries();
   }
 
 
@@ -827,7 +1032,7 @@
       const ot = snap ? snap.ot_hours : 0;
       return `
         <tr data-emp-id="${emp.id}" data-rate-type="monthly">
-          <td>${emp.name}<div style="font-size:11px;color:var(--muted);">₱${emp.rate_amount}/mo${snap ? ' · from PulseTime' : ''}</div></td>
+          <td>${emp.name}<div style="font-size:11px;color:var(--muted);">₱${emp.rate_amount}/mo${snap ? ' · from attendance records' : ''}</div></td>
           <td><input type="number" class="cell-input" data-field="unpaidDays" value="${unpaidDays}" min="0" step="0.5" style="width:56px;"></td>
           <td><input type="number" class="cell-input" data-field="otHours" value="${ot}" min="0" step="0.5" style="width:56px;"></td>
           <td><input type="number" class="cell-input" data-field="holidayPay" value="0" min="0" step="0.01" style="width:70px;"></td>
@@ -844,7 +1049,7 @@
       const ot = snap ? snap.ot_hours : 0;
       return `
         <tr data-emp-id="${emp.id}" data-rate-type="daily">
-          <td>${emp.name}<div style="font-size:11px;color:var(--muted);">₱${emp.rate_amount}/day${snap ? ' · from PulseTime' : ''}</div></td>
+          <td>${emp.name}<div style="font-size:11px;color:var(--muted);">₱${emp.rate_amount}/day${snap ? ' · from attendance records' : ''}</div></td>
           <td><input type="number" class="cell-input" data-field="payableDays" value="${days}" min="0" step="0.5" style="width:56px;"></td>
           <td><input type="number" class="cell-input" data-field="otHours" value="${ot}" min="0" step="0.5" style="width:56px;"></td>
           <td><input type="number" class="cell-input" data-field="holidayPay" value="0" min="0" step="0.01" style="width:70px;"></td>
@@ -1953,6 +2158,47 @@
             <select id="att-period-select" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
           </div>
           <button type="button" class="btn-add" id="pull-pulsetime-btn">Pull from PulseTime</button>
+        </div>
+      </div>
+
+      <div class="panel" id="manual-attendance-panel">
+        <h3 id="manual-att-form-title">Manual time entry</h3>
+        <div class="panel-sub">For staff not enrolled in PulseTime (or to hand-correct a specific day). Uses the payroll period selected above — pick that first. Saving a manual entry for a date that was already pulled from PulseTime replaces that day's record.</div>
+        <form id="manual-att-form" class="form-grid" style="grid-template-columns: 1.4fr 1fr 0.8fr 0.8fr 1fr; align-items: end; gap:12px;">
+          <div class="field">
+            <label for="manual-att-employee">Employee</label>
+            <select id="manual-att-employee" required style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+          </div>
+          <div class="field">
+            <label for="manual-att-date">Date</label>
+            <input type="date" id="manual-att-date" required style="width:100%; padding:10px 12px; border:1px solid var(--line); font-family:inherit; font-size:14px;">
+          </div>
+          <div class="field">
+            <label for="manual-att-timein">Time in</label>
+            <input type="time" id="manual-att-timein" style="width:100%; padding:10px 12px; border:1px solid var(--line); font-family:inherit; font-size:14px;">
+          </div>
+          <div class="field">
+            <label for="manual-att-timeout">Time out</label>
+            <input type="time" id="manual-att-timeout" style="width:100%; padding:10px 12px; border:1px solid var(--line); font-family:inherit; font-size:14px;">
+          </div>
+          <div class="field">
+            <label for="manual-att-status">Attendance status</label>
+            <select id="manual-att-status" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+          </div>
+          <div style="grid-column: 1 / -1; display:flex; gap:10px; margin-top:4px;">
+            <button type="submit" class="btn-add" id="manual-att-save-btn">Add entry</button>
+            <button type="button" class="btn-icon hidden" id="manual-att-cancel-btn">Cancel edit</button>
+          </div>
+        </form>
+        <div class="panel-sub" style="margin-top:6px;">Leave a whole day out of time in/out and pick a status (e.g. Paid Leave) instead — hours are left at 0 for those days.</div>
+
+        <div style="overflow-x:auto; margin-top:18px;">
+        <table>
+          <thead><tr>
+            <th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th><th>Status</th><th>Actions</th>
+          </tr></thead>
+          <tbody id="manual-att-tbody"><tr><td colspan="6" class="empty">Select a payroll period above.</td></tr></tbody>
+        </table>
         </div>
       </div>
 
