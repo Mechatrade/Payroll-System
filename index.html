@@ -73,11 +73,13 @@
     if (user) {
       currentUserRole = await ensureUserRole(user);
       document.getElementById('user-email').textContent = `${user.email} · ${currentUserRole === 'admin' ? 'Admin' : 'Staff'}`;
+      await loadStatutorySettings();
       loadEmployees();
       loadDashboard();
       loadPeriods();
       loadEmployeesForProcessing();
       loadHolidays();
+      renderSettingsForm();
     }
   });
 
@@ -98,6 +100,175 @@
       tx.set(userRef, { email: user.email, role: assignedRole, created_at: serverTimestamp() });
     });
     return assignedRole;
+  }
+
+  // ---------- Statutory & pay-premium settings (Firestore-backed, Settings tab) ----------
+  // First login ever seeds Firestore with the code defaults (STATUTORY_2026 / day-type
+  // multipliers / NSD_RATE above) so there's always something to view/edit immediately.
+  // Every login after that overwrites the in-memory defaults with whatever's saved,
+  // so an admin's edit takes effect for every user on their next login without a redeploy.
+  let statutorySettingsLoaded = false;
+  async function loadStatutorySettings() {
+    try {
+      const ref = doc(db, 'settings', 'statutory');
+      const snap = await getDoc(ref);
+      if (snap.exists()) {
+        const data = snap.data();
+        if (data.sss) STATUTORY_2026.sss = data.sss;
+        if (data.philhealth) STATUTORY_2026.philhealth = data.philhealth;
+        if (data.pagibig) STATUTORY_2026.pagibig = data.pagibig;
+        if (data.taxMonthly) STATUTORY_2026.taxMonthly = data.taxMonthly;
+        if (data.dayTypeWorked) window.__mpCalc.DAY_TYPE_WORKED_MULTIPLIER = data.dayTypeWorked;
+        if (data.dayTypeOT) window.__mpCalc.DAY_TYPE_OT_MULTIPLIER = data.dayTypeOT;
+        if (typeof data.nsdRate === 'number') NSD_RATE = data.nsdRate;
+      } else {
+        await setDoc(ref, {
+          sss: STATUTORY_2026.sss, philhealth: STATUTORY_2026.philhealth, pagibig: STATUTORY_2026.pagibig,
+          taxMonthly: STATUTORY_2026.taxMonthly,
+          dayTypeWorked: window.__mpCalc.DAY_TYPE_WORKED_MULTIPLIER, dayTypeOT: window.__mpCalc.DAY_TYPE_OT_MULTIPLIER,
+          nsdRate: NSD_RATE, seeded_at: serverTimestamp()
+        });
+      }
+      statutorySettingsLoaded = true;
+    } catch (err) {
+      console.error('Could not load statutory settings, using code defaults:', err);
+    }
+  }
+
+  async function saveStatutorySettings(payload) {
+    await setDoc(doc(db, 'settings', 'statutory'), { ...payload, updated_at: serverTimestamp() });
+    // Apply immediately in-memory so calculations reflect the change without a reload.
+    STATUTORY_2026.sss = payload.sss;
+    STATUTORY_2026.philhealth = payload.philhealth;
+    STATUTORY_2026.pagibig = payload.pagibig;
+    STATUTORY_2026.taxMonthly = payload.taxMonthly;
+    window.__mpCalc.DAY_TYPE_WORKED_MULTIPLIER = payload.dayTypeWorked;
+    window.__mpCalc.DAY_TYPE_OT_MULTIPLIER = payload.dayTypeOT;
+    NSD_RATE = payload.nsdRate;
+  }
+
+  const DAY_TYPE_LABELS = {
+    regular: 'Regular Workday',
+    rest_day: 'Rest Day',
+    special_non_working: 'Special (Non-working) Day',
+    special_rest_day: 'Special Day + Rest Day',
+    regular_holiday: 'Regular Holiday',
+    regular_holiday_rest_day: 'Regular Holiday + Rest Day',
+    double_holiday: 'Double Holiday',
+    double_holiday_rest_day: 'Double Holiday + Rest Day'
+  };
+  const DAY_TYPE_ORDER = Object.keys(DAY_TYPE_LABELS);
+
+  function pct(fraction) { return Math.round((fraction || 0) * 10000) / 100; } // 0.05 -> 5
+  function frac(percent) { return (parseFloat(percent) || 0) / 100; } // 5 -> 0.05
+
+  function renderSettingsForm() {
+    const form = document.getElementById('settings-form');
+    if (!form) return;
+    const isAdmin = currentUserRole === 'admin';
+
+    document.getElementById('set-sss-rateTotal').value = pct(STATUTORY_2026.sss.rateTotal);
+    document.getElementById('set-sss-employeeShare').value = pct(STATUTORY_2026.sss.employeeShare);
+    document.getElementById('set-sss-mscFloor').value = STATUTORY_2026.sss.mscFloor;
+    document.getElementById('set-sss-mscCeiling').value = STATUTORY_2026.sss.mscCeiling;
+    document.getElementById('set-sss-mscStep').value = STATUTORY_2026.sss.mscStep;
+    document.getElementById('set-sss-ecThreshold').value = STATUTORY_2026.sss.ecThreshold;
+    document.getElementById('set-sss-ecBelow').value = STATUTORY_2026.sss.ecBelow;
+    document.getElementById('set-sss-ecAtOrAbove').value = STATUTORY_2026.sss.ecAtOrAbove;
+
+    document.getElementById('set-ph-rateTotal').value = pct(STATUTORY_2026.philhealth.rateTotal);
+    document.getElementById('set-ph-employeeShare').value = pct(STATUTORY_2026.philhealth.employeeShare);
+    document.getElementById('set-ph-floor').value = STATUTORY_2026.philhealth.floor;
+    document.getElementById('set-ph-ceiling').value = STATUTORY_2026.philhealth.ceiling;
+
+    document.getElementById('set-pi-rateLow').value = pct(STATUTORY_2026.pagibig.rateLow);
+    document.getElementById('set-pi-rateStandard').value = pct(STATUTORY_2026.pagibig.rateStandard);
+    document.getElementById('set-pi-lowThreshold').value = STATUTORY_2026.pagibig.lowThreshold;
+    document.getElementById('set-pi-mfsCap').value = STATUTORY_2026.pagibig.mfsCap;
+
+    document.getElementById('set-nsd-rate').value = pct(NSD_RATE);
+
+    renderTaxBracketRows(STATUTORY_2026.taxMonthly);
+    renderDayTypeRows(window.__mpCalc.DAY_TYPE_WORKED_MULTIPLIER, window.__mpCalc.DAY_TYPE_OT_MULTIPLIER);
+
+    // Read-only for non-admins: disable every input/button, show the notice.
+    document.getElementById('settings-readonly-notice').classList.toggle('hidden', isAdmin);
+    form.querySelectorAll('input, button').forEach(el => { el.disabled = !isAdmin; });
+
+    if (statutorySettingsLoaded) {
+      getDoc(doc(db, 'settings', 'statutory')).then(snap => {
+        if (snap.exists() && snap.data().updated_at) {
+          const d = snap.data().updated_at.toDate ? snap.data().updated_at.toDate() : null;
+          document.getElementById('settings-updated-note').textContent = d ? `Last updated ${d.toLocaleString('en-PH', { timeZone: 'Asia/Manila' })}` : '';
+        }
+      }).catch(() => {});
+    }
+  }
+
+  function renderTaxBracketRows(brackets) {
+    const tbody = document.getElementById('settings-tax-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = brackets.map((b, i) => `
+      <tr data-row="${i}">
+        <td><input type="number" class="tax-floor" value="${b.floor}" step="1" min="0" style="width:100px;"></td>
+        <td><input type="number" class="tax-base" value="${b.base}" step="0.01" min="0" style="width:100px;"></td>
+        <td><input type="number" class="tax-rate" value="${pct(b.rate)}" step="0.01" min="0" style="width:80px;"></td>
+        <td><button type="button" class="btn-icon" style="color:var(--red);" onclick="this.closest('tr').remove()">Remove</button></td>
+      </tr>`).join('');
+  }
+
+  function renderDayTypeRows(worked, ot) {
+    const tbody = document.getElementById('settings-daytype-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = DAY_TYPE_ORDER.map(key => `
+      <tr data-daytype="${key}">
+        <td>${DAY_TYPE_LABELS[key]}</td>
+        <td><input type="number" class="daytype-worked" value="${worked[key] ?? 1}" step="0.01" min="0" style="width:90px;"></td>
+        <td><input type="number" class="daytype-ot" value="${ot[key] ?? 1.25}" step="0.01" min="0" style="width:90px;"></td>
+      </tr>`).join('');
+  }
+
+  function collectSettingsPayload() {
+    const taxMonthly = Array.from(document.querySelectorAll('#settings-tax-tbody tr')).map(tr => ({
+      floor: parseFloat(tr.querySelector('.tax-floor').value) || 0,
+      base: parseFloat(tr.querySelector('.tax-base').value) || 0,
+      rate: frac(tr.querySelector('.tax-rate').value)
+    })).sort((a, b) => a.floor - b.floor);
+
+    const dayTypeWorked = {}, dayTypeOT = {};
+    document.querySelectorAll('#settings-daytype-tbody tr').forEach(tr => {
+      const key = tr.dataset.daytype;
+      dayTypeWorked[key] = parseFloat(tr.querySelector('.daytype-worked').value) || 1;
+      dayTypeOT[key] = parseFloat(tr.querySelector('.daytype-ot').value) || 1.25;
+    });
+
+    return {
+      sss: {
+        rateTotal: frac(document.getElementById('set-sss-rateTotal').value),
+        employeeShare: frac(document.getElementById('set-sss-employeeShare').value),
+        mscFloor: parseFloat(document.getElementById('set-sss-mscFloor').value) || 0,
+        mscCeiling: parseFloat(document.getElementById('set-sss-mscCeiling').value) || 0,
+        mscStep: parseFloat(document.getElementById('set-sss-mscStep').value) || 500,
+        ecThreshold: parseFloat(document.getElementById('set-sss-ecThreshold').value) || 0,
+        ecBelow: parseFloat(document.getElementById('set-sss-ecBelow').value) || 0,
+        ecAtOrAbove: parseFloat(document.getElementById('set-sss-ecAtOrAbove').value) || 0
+      },
+      philhealth: {
+        rateTotal: frac(document.getElementById('set-ph-rateTotal').value),
+        employeeShare: frac(document.getElementById('set-ph-employeeShare').value),
+        floor: parseFloat(document.getElementById('set-ph-floor').value) || 0,
+        ceiling: parseFloat(document.getElementById('set-ph-ceiling').value) || 0
+      },
+      pagibig: {
+        rateLow: frac(document.getElementById('set-pi-rateLow').value),
+        rateStandard: frac(document.getElementById('set-pi-rateStandard').value),
+        lowThreshold: parseFloat(document.getElementById('set-pi-lowThreshold').value) || 0,
+        mfsCap: parseFloat(document.getElementById('set-pi-mfsCap').value) || 0
+      },
+      taxMonthly,
+      dayTypeWorked, dayTypeOT,
+      nsdRate: frac(document.getElementById('set-nsd-rate').value)
+    };
   }
 
 
@@ -204,6 +375,35 @@
 
     document.getElementById('view-report-btn').addEventListener('click', viewReport);
     document.getElementById('print-report-btn').addEventListener('click', printReport);
+
+    document.getElementById('settings-add-tax-row').addEventListener('click', () => {
+      const tbody = document.getElementById('settings-tax-tbody');
+      const row = document.createElement('tr');
+      row.innerHTML = `
+        <td><input type="number" class="tax-floor" value="0" step="1" min="0" style="width:100px;"></td>
+        <td><input type="number" class="tax-base" value="0" step="0.01" min="0" style="width:100px;"></td>
+        <td><input type="number" class="tax-rate" value="0" step="0.01" min="0" style="width:80px;"></td>
+        <td><button type="button" class="btn-icon" style="color:var(--red);" onclick="this.closest('tr').remove()">Remove</button></td>`;
+      tbody.appendChild(row);
+    });
+
+    document.getElementById('settings-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (currentUserRole !== 'admin') return;
+      const btn = document.getElementById('settings-save-btn');
+      btn.disabled = true;
+      btn.textContent = 'Saving…';
+      try {
+        await saveStatutorySettings(collectSettingsPayload());
+        renderSettingsForm();
+        alert('Settings saved. New computations will use these values immediately.');
+      } catch (err) {
+        alert('Could not save settings: ' + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Save all settings';
+      }
+    });
   });
 
   // ---------- Employees ----------
@@ -310,9 +510,10 @@
   // Sources: SSS Circular (RA 11199, 15% total / MSC 5,000-35,000, step 500);
   // PhilHealth (5% total, floor 10,000 / ceiling 100,000); Pag-IBIG (HDMF Circular 460, 2% / MFS cap 10,000);
   // BIR withholding (TRAIN Law, RR 11-2018 Annex E, effective Jan 2023, unchanged through 2026).
-  // These are approximations of the official bracket tables — verify against BIR/SSS/PhilHealth/Pag-IBIG
-  // circulars before relying on them for actual remittance.
-  const STATUTORY_2026 = {
+  // These are DEFAULTS only — the live values are Firestore-backed (settings/statutory,
+  // see loadStatutorySettings below) and editable from the Settings tab. This object is
+  // overwritten in place once settings load, and re-seeds Firestore on first run.
+  let STATUTORY_2026 = {
     sss: { rateTotal: 0.15, employeeShare: 0.05, mscFloor: 5000, mscCeiling: 35000, mscStep: 500, ecThreshold: 15000, ecBelow: 10, ecAtOrAbove: 30 },
     philhealth: { rateTotal: 0.05, employeeShare: 0.025, floor: 10000, ceiling: 100000 },
     // Pag-IBIG MFS cap is ₱10,000 as of HDMF Circular 460 (effective Feb 2024, current through 2026).
@@ -328,6 +529,7 @@
       { floor: 666667,   base: 200833.33,  rate: 0.35 }
     ]
   };
+  let NSD_RATE = 0.10; // night shift differential, 10% (Labor Code Art. 86) — Settings-editable
 
   // ---------- Payroll calculation engine (shared logic, daily + monthly) ----------
   // Kept here as the seed for shared/payroll-calc.js once the module is split out.
@@ -531,8 +733,8 @@
         // regular hours are worked first chronologically.
         const nightInRegular = Math.min(nightMin, regMin);
         const nightInOT = Math.max(Math.min(nightMin, regMin + otMin) - regMin, 0);
-        nsdPay += (nightInRegular / 60) * hourlyRate * workedMult * 0.10
-                + (nightInOT / 60) * hourlyRate * otMult * 0.10;
+        nsdPay += (nightInRegular / 60) * hourlyRate * workedMult * NSD_RATE
+                + (nightInOT / 60) * hourlyRate * otMult * NSD_RATE;
       });
 
       return {
@@ -2373,6 +2575,7 @@
     <button class="nav-item" data-target="view-approval">Approval</button>
     <button class="nav-item" data-target="view-payslip">Payslips</button>
     <button class="nav-item" data-target="view-reports">Reports</button>
+    <button class="nav-item" data-target="view-settings">Settings</button>
   </nav>
 
   <main class="main">
@@ -2750,6 +2953,79 @@
         <div class="stat-grid" id="report-stats" style="margin-bottom:24px;"></div>
         <div id="report-register-content"></div>
       </div>
+    </section>
+
+    <section id="view-settings" class="view hidden">
+      <div class="panel hidden" id="settings-readonly-notice">
+        <div class="panel-sub" style="margin:0;">Viewing statutory rates and pay-premium multipliers below. Only an admin account can edit these — changes here take effect immediately for everyone, without a redeploy.</div>
+      </div>
+      <form id="settings-form">
+        <div class="panel">
+          <h3>SSS</h3>
+          <div class="panel-sub">Monthly Salary Credit (MSC) bracket and contribution rates.</div>
+          <div class="form-grid">
+            <div class="field"><label>Total rate (%)</label><input type="number" id="set-sss-rateTotal" step="0.01" min="0"></div>
+            <div class="field"><label>Employee share of total (%)</label><input type="number" id="set-sss-employeeShare" step="0.01" min="0"></div>
+            <div class="field"><label>MSC floor (₱)</label><input type="number" id="set-sss-mscFloor" step="1" min="0"></div>
+            <div class="field"><label>MSC ceiling (₱)</label><input type="number" id="set-sss-mscCeiling" step="1" min="0"></div>
+            <div class="field"><label>MSC step (₱)</label><input type="number" id="set-sss-mscStep" step="1" min="0"></div>
+            <div class="field"><label>EC threshold MSC (₱)</label><input type="number" id="set-sss-ecThreshold" step="1" min="0"></div>
+            <div class="field"><label>EC below threshold (₱)</label><input type="number" id="set-sss-ecBelow" step="0.01" min="0"></div>
+            <div class="field"><label>EC at/above threshold (₱)</label><input type="number" id="set-sss-ecAtOrAbove" step="0.01" min="0"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>PhilHealth</h3>
+          <div class="form-grid">
+            <div class="field"><label>Total rate (%)</label><input type="number" id="set-ph-rateTotal" step="0.01" min="0"></div>
+            <div class="field"><label>Employee share of total (%)</label><input type="number" id="set-ph-employeeShare" step="0.01" min="0"></div>
+            <div class="field"><label>Salary floor (₱)</label><input type="number" id="set-ph-floor" step="1" min="0"></div>
+            <div class="field"><label>Salary ceiling (₱)</label><input type="number" id="set-ph-ceiling" step="1" min="0"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Pag-IBIG</h3>
+          <div class="form-grid">
+            <div class="field"><label>Low-income rate (%)</label><input type="number" id="set-pi-rateLow" step="0.01" min="0"></div>
+            <div class="field"><label>Standard rate (%)</label><input type="number" id="set-pi-rateStandard" step="0.01" min="0"></div>
+            <div class="field"><label>Low-income threshold (₱)</label><input type="number" id="set-pi-lowThreshold" step="1" min="0"></div>
+            <div class="field"><label>Max fund salary cap (₱)</label><input type="number" id="set-pi-mfsCap" step="1" min="0"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Withholding tax brackets (monthly)</h3>
+          <div class="panel-sub">BIR TRAIN table. Each bracket applies once monthly taxable income reaches its floor.</div>
+          <table>
+            <thead><tr><th>Floor (₱)</th><th>Base tax (₱)</th><th>Rate (%)</th><th></th></tr></thead>
+            <tbody id="settings-tax-tbody"></tbody>
+          </table>
+          <button type="button" class="btn-icon" id="settings-add-tax-row" style="color:var(--navy); margin-top:10px;">+ Add bracket</button>
+        </div>
+
+        <div class="panel">
+          <h3>Pay premium multipliers (DOLE day types)</h3>
+          <div class="panel-sub">Multiplier on the daily rate for a worked day of this type, and the extra multiplier applied to OT hours on that day.</div>
+          <table>
+            <thead><tr><th>Day type</th><th>Worked multiplier (×)</th><th>OT multiplier (×)</th></tr></thead>
+            <tbody id="settings-daytype-tbody"></tbody>
+          </table>
+        </div>
+
+        <div class="panel">
+          <h3>Night shift differential</h3>
+          <div class="form-grid">
+            <div class="field"><label>NSD rate (%)</label><input type="number" id="set-nsd-rate" step="0.01" min="0"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div id="settings-updated-note" style="font-size:12px; color:var(--muted); margin-bottom:14px;"></div>
+          <button type="submit" class="btn-add" id="settings-save-btn">Save all settings</button>
+        </div>
+      </form>
     </section>
   </main>
 </div>
