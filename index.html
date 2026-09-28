@@ -367,6 +367,7 @@
     document.getElementById('manual-att-status').addEventListener('change', updateManualAttTimeRequirement);
     document.getElementById('att-period-select').addEventListener('change', () => loadManualEntries());
     document.getElementById('manual-att-filter-period').addEventListener('change', () => loadManualEntries());
+    document.getElementById('manual-att-filter-employee').addEventListener('change', () => loadManualEntries());
     document.getElementById('holiday-form').addEventListener('submit', addHoliday);
     document.getElementById('adjustment-form').addEventListener('submit', addAdjustment);
     document.getElementById('manual-att-status').innerHTML = ATTENDANCE_STATUSES.map(s =>
@@ -1451,6 +1452,19 @@
       `<option value="${e.id}">${e.name}${e.email ? '' : ' — no PulseTime email on file'}</option>`
     ).join('') || '<option value="">No active employees yet</option>';
     if (current && active.find(e => e.id === current)) sel.value = current;
+
+    // Manual-entry list filter — includes every employee that's ever had an
+    // entry recorded (not just currently-active ones), so filtering still
+    // works for someone who was since made inactive.
+    const filterSel = document.getElementById('manual-att-filter-employee');
+    if (filterSel) {
+      const filterCurrent = filterSel.value;
+      const namedInEntries = new Set((manualEntriesCache || []).map(r => r.employee_id));
+      const filterOptions = employeesCache.filter(e => e.status === 'active' || namedInEntries.has(e.id));
+      filterSel.innerHTML = '<option value="">All employees</option>' +
+        filterOptions.map(e => `<option value="${e.id}">${e.name}</option>`).join('');
+      if (filterCurrent && filterOptions.find(e => e.id === filterCurrent)) filterSel.value = filterCurrent;
+    }
   }
 
   // Mirrors the PulseTime pull's hours math: 1hr unpaid lunch auto-deducted on
@@ -1644,10 +1658,20 @@
     snap.forEach(d => manualEntriesCache.push({ id: d.id, ...d.data() }));
     manualEntriesCache.sort((a, b) => a.date.localeCompare(b.date) || (a.employee_id || '').localeCompare(b.employee_id || ''));
 
+    // Refresh the employee-filter dropdown now that we know who actually has
+    // entries in this period (covers employees since made inactive too).
+    populateManualAttEmployeeSelect();
+
+    const employeeFilterSel = document.getElementById('manual-att-filter-employee');
+    const employeeFilterId = employeeFilterSel ? employeeFilterSel.value : '';
+    const visibleEntries = employeeFilterId
+      ? manualEntriesCache.filter(r => r.employee_id === employeeFilterId)
+      : manualEntriesCache;
+
     const fmtTime = (iso) => iso ? new Date(iso).toLocaleTimeString('en-PH', { timeZone: 'Asia/Manila', hour: '2-digit', minute: '2-digit' }) : '—';
     const statusLabel = (v) => (ATTENDANCE_STATUSES.find(s => s.value === v) || {}).label || '—';
 
-    tbody.innerHTML = manualEntriesCache.map(r => {
+    tbody.innerHTML = visibleEntries.map(r => {
       const emp = employeesCache.find(e => e.id === r.employee_id);
       const flagsHtml = buildPayFlagsHtml(r);
       return `
@@ -1663,7 +1687,7 @@
             <button class="btn-icon" style="margin-left:10px;" onclick='__mpDeleteManualEntry("${r.id}")'>Delete</button>
           </td>
         </tr>`;
-    }).join('') || `<tr><td colspan="7" class="empty">No manual entries for this period yet.</td></tr>`;
+    }).join('') || `<tr><td colspan="7" class="empty">${employeeFilterId ? 'No manual entries for this employee in this period.' : 'No manual entries for this period yet.'}</td></tr>`;
   }
 
   // Aggregates the saved daily records for one employee/period into the
@@ -3091,9 +3115,15 @@
         </form>
         <div class="panel-sub" style="margin-top:6px;">Leave a whole day out of time in/out and pick a status (e.g. Paid Leave) instead — hours are left at 0 for those days.</div>
 
-        <div class="field" style="margin-top:18px; max-width:340px;">
-          <label for="manual-att-filter-period">Filter recorded entries by payroll period</label>
-          <select id="manual-att-filter-period" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+        <div class="form-grid" style="grid-template-columns: 1fr 1fr; gap:12px; margin-top:18px;">
+          <div class="field">
+            <label for="manual-att-filter-period">Filter recorded entries by payroll period</label>
+            <select id="manual-att-filter-period" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+          </div>
+          <div class="field">
+            <label for="manual-att-filter-employee">Filter by employee</label>
+            <select id="manual-att-filter-employee" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"><option value="">All employees</option></select>
+          </div>
         </div>
 
         <div style="overflow-x:auto; margin-top:14px;">
