@@ -362,6 +362,7 @@
     document.getElementById('manual-att-cancel-btn').addEventListener('click', exitManualAttEditMode);
     document.getElementById('manual-att-status').addEventListener('change', updateManualAttTimeRequirement);
     document.getElementById('att-period-select').addEventListener('change', () => loadManualEntries());
+    document.getElementById('manual-att-filter-period').addEventListener('change', () => loadManualEntries());
     document.getElementById('holiday-form').addEventListener('submit', addHoliday);
     document.getElementById('adjustment-form').addEventListener('submit', addAdjustment);
     document.getElementById('manual-att-status').innerHTML = ATTENDANCE_STATUSES.map(s =>
@@ -1563,10 +1564,15 @@
   }
 
   async function loadManualEntries() {
-    const periodId = document.getElementById('att-period-select').value;
+    // Filters the LIST of already-saved entries — independent of the "Payroll
+    // period" select up top, which decides which period a NEW entry gets saved
+    // against. Lets an admin browse a past cutoff's manual entries without
+    // switching the Add-entry form away from the period they're actively working in.
+    const filterSel = document.getElementById('manual-att-filter-period');
+    const periodId = (filterSel && filterSel.value) || document.getElementById('att-period-select').value;
     const tbody = document.getElementById('manual-att-tbody');
     if (!tbody) return;
-    if (!periodId) { manualEntriesCache = []; tbody.innerHTML = `<tr><td colspan="7" class="empty">Select a payroll period above.</td></tr>`; return; }
+    if (!periodId) { manualEntriesCache = []; tbody.innerHTML = `<tr><td colspan="7" class="empty">Select a payroll period to filter by.</td></tr>`; return; }
 
     const q = query(collection(db, 'attendance'), where('period_id', '==', periodId), where('source', '==', 'manual'));
     const snap = await getDocs(q);
@@ -1652,6 +1658,16 @@
     const current = sel.value;
     sel.innerHTML = periodsCache.map(p => `<option value="${p.id}">${p.cutoff_start} – ${p.cutoff_end}</option>`).join('') || '<option value="">No periods yet</option>';
     if (current && periodsCache.find(p => p.id === current)) sel.value = current;
+
+    // Manual-entry filter: same option list; keep whatever the admin had
+    // filtered to if it's still a valid period, otherwise default to match
+    // the Payroll period select above so the list isn't empty on first load.
+    const filterSel = document.getElementById('manual-att-filter-period');
+    if (filterSel) {
+      const filterCurrent = filterSel.value;
+      filterSel.innerHTML = periodsCache.map(p => `<option value="${p.id}">${p.cutoff_start} – ${p.cutoff_end}</option>`).join('') || '<option value="">No periods yet</option>';
+      filterSel.value = (filterCurrent && periodsCache.find(p => p.id === filterCurrent)) ? filterCurrent : sel.value;
+    }
     loadManualEntries();
   }
 
@@ -2954,7 +2970,7 @@
       <div class="attendance-col-right">
       <div class="panel" id="manual-attendance-panel">
         <h3 id="manual-att-form-title">Manual time entry</h3>
-        <div class="panel-sub">For staff not enrolled in PulseTime (or to hand-correct a specific day). Uses the payroll period selected on the left — pick that first. Saving a manual entry for a date that was already pulled from PulseTime replaces that day's record.</div>
+        <div class="panel-sub">For staff not enrolled in PulseTime (or to hand-correct a specific day). New entries below are saved against the payroll period selected on the left — pick that first. The list further down can be filtered to any payroll period independently, for browsing past cutoffs. Saving a manual entry for a date that was already pulled from PulseTime replaces that day's record.</div>
         <form id="manual-att-form" class="form-grid" style="grid-template-columns: 1fr 1fr; align-items: end; gap:12px;">
           <div class="field">
             <label for="manual-att-employee">Employee</label>
@@ -2983,7 +2999,12 @@
         </form>
         <div class="panel-sub" style="margin-top:6px;">Leave a whole day out of time in/out and pick a status (e.g. Paid Leave) instead — hours are left at 0 for those days.</div>
 
-        <div style="overflow-x:auto; margin-top:18px;">
+        <div class="field" style="margin-top:18px; max-width:340px;">
+          <label for="manual-att-filter-period">Filter recorded entries by payroll period</label>
+          <select id="manual-att-filter-period" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+        </div>
+
+        <div style="overflow-x:auto; margin-top:14px;">
         <table style="min-width:640px;">
           <thead><tr>
             <th style="white-space:nowrap;">Employee</th><th style="white-space:nowrap;">Date</th><th style="white-space:nowrap;">Time In</th><th style="white-space:nowrap;">Time Out</th><th style="white-space:nowrap;">Status</th><th style="white-space:nowrap;">Pay flags</th><th style="white-space:nowrap;">Actions</th>
