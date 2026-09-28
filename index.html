@@ -346,18 +346,6 @@
     document.getElementById('rate-type').addEventListener('change', (e) => {
       const isDaily = e.target.value === 'daily';
       document.getElementById('rate-label').textContent = isDaily ? 'Daily rate (₱)' : 'Monthly rate (₱)';
-      document.getElementById('emp-taxable-field').classList.toggle('hidden', isDaily);
-      document.getElementById('emp-nontaxable-field').classList.toggle('hidden', isDaily);
-      if (!isDaily) syncNonTaxableField();
-    });
-
-    // Non-taxable is always the complement of Taxable within the Monthly rate
-    // (Total), so it's computed live rather than separately entered — matches
-    // the fixed Taxable/Non-taxable/Total salary-structure breakdown used for
-    // Office Staff (Total = Taxable + Non-taxable, always).
-    document.getElementById('emp-taxable').addEventListener('input', syncNonTaxableField);
-    document.getElementById('rate-amount').addEventListener('input', () => {
-      if (document.getElementById('rate-type').value === 'monthly') syncNonTaxableField();
     });
 
     document.getElementById('employee-form').addEventListener('submit', addEmployee);
@@ -365,8 +353,6 @@
       exitEditMode();
       document.getElementById('employee-form').reset();
       document.getElementById('rate-label').textContent = 'Daily rate (₱)';
-      document.getElementById('emp-taxable-field').classList.add('hidden');
-      document.getElementById('emp-nontaxable-field').classList.add('hidden');
     });
     document.getElementById('period-form').addEventListener('submit', createPeriod);
     document.getElementById('save-batch-btn').addEventListener('click', saveBatch);
@@ -424,34 +410,15 @@
   });
 
   // ---------- Employees ----------
-  // Keeps the read-only Non-taxable field equal to Monthly rate − Taxable, so
-  // Taxable + Non-taxable always reconstitutes the Total (the Monthly rate) —
-  // this is the fixed Office Staff salary-structure split (see image reference),
-  // not a statutory-contribution derivation.
-  function syncNonTaxableField() {
-    const total = parseFloat(document.getElementById('rate-amount').value || 0);
-    let taxable = parseFloat(document.getElementById('emp-taxable').value || 0);
-    if (taxable > total) { taxable = total; document.getElementById('emp-taxable').value = total; }
-    if (taxable < 0) { taxable = 0; document.getElementById('emp-taxable').value = 0; }
-    const nonTaxable = Math.max(Math.round((total - taxable) * 100) / 100, 0);
-    document.getElementById('emp-nontaxable').value = nonTaxable;
-  }
-
   async function addEmployee(e) {
     e.preventDefault();
-    const rateType = document.getElementById('rate-type').value;
-    const rateAmount = parseFloat(document.getElementById('rate-amount').value || 0);
     const emp = {
       name: document.getElementById('emp-name').value.trim(),
       email: document.getElementById('emp-email').value.trim().toLowerCase(),
       position: document.getElementById('emp-position').value.trim(),
       department: document.getElementById('emp-department').value.trim(),
-      rate_type: rateType,
-      rate_amount: rateAmount,
-      // Fixed monthly salary-structure split — Total (rate_amount) = Taxable + Non-taxable.
-      // Daily-rate employees don't carry this split; taxable defaults to the full rate.
-      taxable_amount: rateType === 'monthly' ? parseFloat(document.getElementById('emp-taxable').value || 0) : rateAmount,
-      nontaxable_amount: rateType === 'monthly' ? parseFloat(document.getElementById('emp-nontaxable').value || 0) : 0,
+      rate_type: document.getElementById('rate-type').value,
+      rate_amount: parseFloat(document.getElementById('rate-amount').value || 0),
       date_hired: document.getElementById('emp-date-hired').value || null,
       sss_no: document.getElementById('emp-sss').value.trim(),
       philhealth_no: document.getElementById('emp-philhealth').value.trim(),
@@ -470,8 +437,6 @@
     }
     e.target.reset();
     document.getElementById('rate-label').textContent = 'Daily rate (₱)';
-    document.getElementById('emp-taxable-field').classList.add('hidden');
-    document.getElementById('emp-nontaxable-field').classList.add('hidden');
   }
 
   window.__mpEditEmployee = (id) => {
@@ -485,15 +450,6 @@
     document.getElementById('rate-type').value = emp.rate_type || 'daily';
     document.getElementById('rate-label').textContent = emp.rate_type === 'monthly' ? 'Monthly rate (₱)' : 'Daily rate (₱)';
     document.getElementById('rate-amount').value = emp.rate_amount || '';
-    const isMonthly = emp.rate_type === 'monthly';
-    document.getElementById('emp-taxable-field').classList.toggle('hidden', !isMonthly);
-    document.getElementById('emp-nontaxable-field').classList.toggle('hidden', !isMonthly);
-    if (isMonthly) {
-      // Default a legacy employee with no split recorded yet to fully taxable,
-      // so the fields start consistent rather than blank.
-      document.getElementById('emp-taxable').value = emp.taxable_amount ?? emp.rate_amount ?? 0;
-      syncNonTaxableField();
-    }
     document.getElementById('emp-date-hired').value = emp.date_hired || '';
     document.getElementById('emp-sss').value = emp.sss_no || '';
     document.getElementById('emp-philhealth').value = emp.philhealth_no || '';
@@ -532,15 +488,6 @@
             <td class="num">₱${(d.rate_amount || 0).toLocaleString('en-PH', {minimumFractionDigits: 2})}</td>
             <td class="num">₱${window.__mpCalc.getDailyRateEquivalent(d).toLocaleString('en-PH', {minimumFractionDigits: 2})}</td>
             <td class="num">₱${(window.__mpCalc.getDailyRateEquivalent(d) / 8).toLocaleString('en-PH', {minimumFractionDigits: 2})}</td>
-            ${(() => {
-              if (d.rate_type !== 'monthly') return `<td class="num" style="color:var(--muted);">—</td><td class="num" style="color:var(--muted);">—</td>`;
-              // Fixed salary-structure split recorded on the employee record
-              // (Total = Taxable + Non-taxable = the Monthly rate); legacy
-              // employees saved before this field existed default to fully taxable.
-              const taxable = d.taxable_amount ?? d.rate_amount ?? 0;
-              const nonTaxable = d.nontaxable_amount ?? 0;
-              return `<td class="num">₱${taxable.toLocaleString('en-PH', {minimumFractionDigits: 2})}</td><td class="num">₱${nonTaxable.toLocaleString('en-PH', {minimumFractionDigits: 2})}</td>`;
-            })()}
             <td><span class="status status-${d.status}">${d.status}</span></td>
             <td>
               <button class="btn-icon" style="color:var(--navy);" onclick='__mpEditEmployee("${docSnap.id}")'>Edit</button>
@@ -548,7 +495,7 @@
             </td>
           </tr>`);
       });
-      document.getElementById('employees-tbody').innerHTML = rows.join('') || `<tr><td colspan="11" class="empty">No employees yet. Add your first employee above.</td></tr>`;
+      document.getElementById('employees-tbody').innerHTML = rows.join('') || `<tr><td colspan="9" class="empty">No employees yet. Add your first employee above.</td></tr>`;
       document.getElementById('stat-active-count').textContent = activeCount;
       document.getElementById('stat-daily-count').textContent = dailyCount;
       document.getElementById('stat-monthly-count').textContent = monthlyCount;
@@ -896,31 +843,12 @@
       const net = Math.max(netRaw, 0);
       const needsReview = grossRaw < 0 || netRaw < 0;
 
-      // Taxable / non-taxable split of this cutoff's gross pay (monthly-rate
-      // employees only — displayed in Employee Roster/Processing/Payslip).
-      // This is the FIXED salary-structure split recorded on the employee
-      // record (employee.taxable_amount + employee.nontaxable_amount =
-      // employee.rate_amount, the full Monthly rate) — not derived from SSS/
-      // PhilHealth/Pag-IBIG, which are a separate downstream deduction from
-      // this same gross. The fixed non-taxable portion is prorated the same
-      // way `basic` above is — always ÷2, since basic is unconditionally
-      // semiMonthlyBase regardless of period_type (see above); anything on
-      // top of basic (OT, premiums, other earnings, adjustments) is taxable,
-      // so it's folded in via gross minus non-taxable.
-      let nonTaxableAmount = 0, taxableAmount = gross;
-      if (employee.rate_type === 'monthly') {
-        const nonTaxableBase = (employee.nontaxable_amount || 0) / 2;
-        nonTaxableAmount = Math.min(Math.round(nonTaxableBase * 100) / 100, gross);
-        taxableAmount = Math.max(Math.round((gross - nonTaxableAmount) * 100) / 100, 0);
-      }
-
       return {
         basic, ot, holidayPay, restDayPay, nsdPay, otherEarnings,
         unpaidDeduction,
         gross, grossRaw, sss, sssEmployer, sssEC, philhealth, philhealthEmployer, pagibig, pagibigEmployer, tax,
         otherDeductions, adjustmentEarnings, adjustmentDeductions, adjustmentItems,
         totalDeductions, net, netRaw, needsReview,
-        nonTaxableAmount, taxableAmount,
         contributionMonth: this.contributionMonth(period), cutoffPosition
       };
     }
@@ -1817,8 +1745,6 @@
           <td><input type="number" class="cell-input" data-field="nsdPay" value="${premium.nsdPay}" min="0" step="0.01" style="width:70px;"></td>
           <td><input type="number" class="cell-input" data-field="otherEarnings" value="0" min="0" step="0.01" style="width:70px;"></td>
           <td class="num" style="font-size:11px;" title="From the Adjustments menu — edit there, not here.">${adj.adjustmentItems.length ? `${adj.adjustmentEarnings > 0 ? '+₱' + adj.adjustmentEarnings.toLocaleString('en-PH') : ''}${adj.adjustmentDeductions > 0 ? ' −₱' + adj.adjustmentDeductions.toLocaleString('en-PH') : ''}` : '—'}</td>
-          <td class="num result-taxable">—</td>
-          <td class="num result-nontaxable">—</td>
           <td class="num result-gross">—</td>
           <td class="num result-deductions">—</td>
           <td class="num result-net">—</td>
@@ -1848,7 +1774,7 @@
         </tr>`;
     }).join('');
 
-    document.getElementById('processing-tbody-monthly').innerHTML = monthlyRows || `<tr><td colspan="13" class="empty">No active monthly-rate employees.</td></tr>`;
+    document.getElementById('processing-tbody-monthly').innerHTML = monthlyRows || `<tr><td colspan="11" class="empty">No active monthly-rate employees.</td></tr>`;
     document.getElementById('processing-tbody-daily').innerHTML = dailyRows || `<tr><td colspan="11" class="empty">No active daily-rate employees.</td></tr>`;
 
     document.querySelectorAll('#processing-tbody-monthly .cell-input, #processing-tbody-daily .cell-input')
@@ -1881,10 +1807,6 @@
         };
 
     const rec = window.__mpCalc.computeRecord(emp, inputs, period);
-    const taxableCell = tr.querySelector('.result-taxable');
-    const nonTaxableCell = tr.querySelector('.result-nontaxable');
-    if (taxableCell) taxableCell.textContent = '₱' + rec.taxableAmount.toLocaleString('en-PH', {minimumFractionDigits: 2});
-    if (nonTaxableCell) nonTaxableCell.textContent = '₱' + rec.nonTaxableAmount.toLocaleString('en-PH', {minimumFractionDigits: 2});
     tr.querySelector('.result-gross').textContent = '₱' + rec.gross.toLocaleString('en-PH', {minimumFractionDigits: 2});
     tr.querySelector('.result-deductions').textContent = '₱' + rec.totalDeductions.toLocaleString('en-PH', {minimumFractionDigits: 2});
     const netCell = tr.querySelector('.result-net');
@@ -2118,14 +2040,6 @@
         </tbody>
         <tfoot><tr><td>Total deductions</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace;">−₱${f(rec.totalDeductions)}</td></tr></tfoot>
       </table>
-      ${emp.rate_type === 'monthly' ? `
-      <table class="sheet-table" style="max-width:420px; margin-top:18px;">
-        <thead><tr><th colspan="2" style="text-align:left;">Taxable / non-taxable breakdown</th></tr></thead>
-        <tbody>
-          ${line('Taxable amount', rec.taxableAmount)}
-          ${line('Non-taxable amount', rec.nonTaxableAmount)}
-        </tbody>
-      </table>` : ''}
       <table class="sheet-table" style="max-width:420px; margin-top:18px;">
         <tbody><tr style="font-weight:600;"><td>Net pay</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace; font-size:14px;">₱${f(rec.net)}</td></tr></tbody>
       </table>
@@ -2956,14 +2870,6 @@
               <label for="rate-amount" id="rate-label">Daily rate (₱)</label>
               <input type="number" id="rate-amount" step="0.01" min="0" required>
             </div>
-            <div class="field hidden" id="emp-taxable-field">
-              <label for="emp-taxable">Taxable (₱)</label>
-              <input type="number" id="emp-taxable" step="0.01" min="0">
-            </div>
-            <div class="field hidden" id="emp-nontaxable-field">
-              <label for="emp-nontaxable">Non-taxable (₱) — auto: Monthly rate − Taxable</label>
-              <input type="number" id="emp-nontaxable" step="0.01" min="0" readonly style="background:#F1EEE4;">
-            </div>
             <div class="field">
               <label for="emp-date-hired">Date hired</label>
               <input type="date" id="emp-date-hired">
@@ -2999,13 +2905,11 @@
               <th class="num">Rate</th>
               <th class="num" title="For monthly staff, the DOLE EEMR daily-rate equivalent: (Monthly rate × 12) ÷ Factor">Daily rate (₱)</th>
               <th class="num" title="Daily rate ÷ 8">Per hour (₱)</th>
-              <th class="num" title="Monthly-rate only — fixed salary-structure split recorded on the employee record (Taxable + Non-taxable = Monthly rate).">Taxable (₱)</th>
-              <th class="num" title="Monthly-rate only — fixed salary-structure split recorded on the employee record (Taxable + Non-taxable = Monthly rate).">Non-taxable (₱)</th>
               <th>Status</th><th></th>
             </tr>
           </thead>
           <tbody id="employees-tbody">
-            <tr><td colspan="11" class="empty">Loading…</td></tr>
+            <tr><td colspan="9" class="empty">Loading…</td></tr>
           </tbody>
         </table>
       </div>
@@ -3223,8 +3127,6 @@
               <th>Employee</th><th>Unpaid days</th><th>OT hours</th>
               <th>Holiday pay (₱)</th><th>Rest day pay (₱)</th><th>NSD pay (₱)</th><th>Other earnings (₱)</th>
               <th title="From the Adjustments menu">Adjustments (₱)</th>
-              <th class="num" title="Gross pay minus this cutoff's non-taxable portion (the employee's fixed Non-taxable salary component, pro-rated for the cutoff)">Taxable (₱)</th>
-              <th class="num" title="This cutoff's share of the employee's fixed Non-taxable salary component (see Employee Roster)">Non-taxable (₱)</th>
               <th class="num">Gross</th><th class="num">Deductions</th><th class="num">Net pay</th>
             </tr>
           </thead>
