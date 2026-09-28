@@ -486,6 +486,13 @@
             <td>${d.department || '—'}</td>
             <td><span class="tag tag-${d.rate_type}">${d.rate_type}</span></td>
             <td class="num">₱${(d.rate_amount || 0).toLocaleString('en-PH', {minimumFractionDigits: 2})}</td>
+            <td class="num">₱${(window.__mpCalc.getDailyRateEquivalent(d) / 8).toLocaleString('en-PH', {minimumFractionDigits: 2})}</td>
+            ${(() => {
+              const split = window.__mpCalc.estimateMonthlyTaxableSplit(d);
+              return split
+                ? `<td class="num">₱${split.taxable.toLocaleString('en-PH', {minimumFractionDigits: 2})}</td><td class="num">₱${split.nonTaxable.toLocaleString('en-PH', {minimumFractionDigits: 2})}</td>`
+                : `<td class="num" style="color:var(--muted);">—</td><td class="num" style="color:var(--muted);">—</td>`;
+            })()}
             <td><span class="status status-${d.status}">${d.status}</span></td>
             <td>
               <button class="btn-icon" style="color:var(--navy);" onclick='__mpEditEmployee("${docSnap.id}")'>Edit</button>
@@ -493,7 +500,7 @@
             </td>
           </tr>`);
       });
-      document.getElementById('employees-tbody').innerHTML = rows.join('') || `<tr><td colspan="7" class="empty">No employees yet. Add your first employee above.</td></tr>`;
+      document.getElementById('employees-tbody').innerHTML = rows.join('') || `<tr><td colspan="10" class="empty">No employees yet. Add your first employee above.</td></tr>`;
       document.getElementById('stat-active-count').textContent = activeCount;
       document.getElementById('stat-daily-count').textContent = dailyCount;
       document.getElementById('stat-monthly-count').textContent = monthlyCount;
@@ -841,14 +848,38 @@
       const net = Math.max(netRaw, 0);
       const needsReview = grossRaw < 0 || netRaw < 0;
 
+      // Taxable / non-taxable split of this cutoff's gross pay (monthly-rate
+      // employees only — displayed in Employee Roster/Processing/Payslip).
+      // Non-taxable = this cutoff's employee-share statutory contributions
+      // (SSS/PhilHealth/Pag-IBIG, which reduce taxable income under BIR rules)
+      // plus de minimis benefits. There is no de minimis input field yet, so
+      // deMinimis is always 0 for now — add one later if that's ever needed.
+      const deMinimis = 0;
+      const nonTaxableAmount = Math.round((sss + philhealth + pagibig + deMinimis) * 100) / 100;
+      const taxableAmount = Math.max(Math.round((gross - nonTaxableAmount) * 100) / 100, 0);
+
       return {
         basic, ot, holidayPay, restDayPay, nsdPay, otherEarnings,
         unpaidDeduction,
         gross, grossRaw, sss, sssEmployer, sssEC, philhealth, philhealthEmployer, pagibig, pagibigEmployer, tax,
         otherDeductions, adjustmentEarnings, adjustmentDeductions, adjustmentItems,
         totalDeductions, net, netRaw, needsReview,
+        deMinimis, nonTaxableAmount, taxableAmount,
         contributionMonth: this.contributionMonth(period), cutoffPosition
       };
+    },
+
+    // Rough, no-attendance estimate of the taxable/non-taxable split for a
+    // monthly-rate employee's full nominal monthly salary — used in the
+    // Employee Roster, where there's no payroll period or attendance data to
+    // compute an actual cutoff figure from. Payroll Processing and the
+    // payslip show the real per-cutoff split instead (see computeRecord).
+    estimateMonthlyTaxableSplit(employee) {
+      if (employee.rate_type !== 'monthly') return null;
+      const monthlyComp = employee.rate_amount || 0;
+      const nonTaxable = Math.round((this.sssEmployeeShare(monthlyComp) + this.philhealthEmployeeShare(monthlyComp) + this.pagibigEmployeeShare(monthlyComp)) * 100) / 100;
+      const taxable = Math.max(Math.round((monthlyComp - nonTaxable) * 100) / 100, 0);
+      return { taxable, nonTaxable };
     }
   };
 
@@ -1743,6 +1774,8 @@
           <td><input type="number" class="cell-input" data-field="nsdPay" value="${premium.nsdPay}" min="0" step="0.01" style="width:70px;"></td>
           <td><input type="number" class="cell-input" data-field="otherEarnings" value="0" min="0" step="0.01" style="width:70px;"></td>
           <td class="num" style="font-size:11px;" title="From the Adjustments menu — edit there, not here.">${adj.adjustmentItems.length ? `${adj.adjustmentEarnings > 0 ? '+₱' + adj.adjustmentEarnings.toLocaleString('en-PH') : ''}${adj.adjustmentDeductions > 0 ? ' −₱' + adj.adjustmentDeductions.toLocaleString('en-PH') : ''}` : '—'}</td>
+          <td class="num result-taxable">—</td>
+          <td class="num result-nontaxable">—</td>
           <td class="num result-gross">—</td>
           <td class="num result-deductions">—</td>
           <td class="num result-net">—</td>
@@ -1772,7 +1805,7 @@
         </tr>`;
     }).join('');
 
-    document.getElementById('processing-tbody-monthly').innerHTML = monthlyRows || `<tr><td colspan="11" class="empty">No active monthly-rate employees.</td></tr>`;
+    document.getElementById('processing-tbody-monthly').innerHTML = monthlyRows || `<tr><td colspan="13" class="empty">No active monthly-rate employees.</td></tr>`;
     document.getElementById('processing-tbody-daily').innerHTML = dailyRows || `<tr><td colspan="11" class="empty">No active daily-rate employees.</td></tr>`;
 
     document.querySelectorAll('#processing-tbody-monthly .cell-input, #processing-tbody-daily .cell-input')
@@ -1805,6 +1838,10 @@
         };
 
     const rec = window.__mpCalc.computeRecord(emp, inputs, period);
+    const taxableCell = tr.querySelector('.result-taxable');
+    const nonTaxableCell = tr.querySelector('.result-nontaxable');
+    if (taxableCell) taxableCell.textContent = '₱' + rec.taxableAmount.toLocaleString('en-PH', {minimumFractionDigits: 2});
+    if (nonTaxableCell) nonTaxableCell.textContent = '₱' + rec.nonTaxableAmount.toLocaleString('en-PH', {minimumFractionDigits: 2});
     tr.querySelector('.result-gross').textContent = '₱' + rec.gross.toLocaleString('en-PH', {minimumFractionDigits: 2});
     tr.querySelector('.result-deductions').textContent = '₱' + rec.totalDeductions.toLocaleString('en-PH', {minimumFractionDigits: 2});
     const netCell = tr.querySelector('.result-net');
@@ -2038,6 +2075,14 @@
         </tbody>
         <tfoot><tr><td>Total deductions</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace;">−₱${f(rec.totalDeductions)}</td></tr></tfoot>
       </table>
+      ${emp.rate_type === 'monthly' ? `
+      <table class="sheet-table" style="max-width:420px; margin-top:18px;">
+        <thead><tr><th colspan="2" style="text-align:left;">Taxable / non-taxable breakdown</th></tr></thead>
+        <tbody>
+          ${line('Taxable amount', rec.taxableAmount)}
+          ${line('Non-taxable amount (SSS/PhilHealth/Pag-IBIG + de minimis)', rec.nonTaxableAmount)}
+        </tbody>
+      </table>` : ''}
       <table class="sheet-table" style="max-width:420px; margin-top:18px;">
         <tbody><tr style="font-weight:600;"><td>Net pay</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace; font-size:14px;">₱${f(rec.net)}</td></tr></tbody>
       </table>
@@ -2900,11 +2945,14 @@
           <thead>
             <tr>
               <th>Name</th><th>Position</th><th>Department</th><th>Rate type</th>
-              <th class="num">Rate</th><th>Status</th><th></th>
+              <th class="num">Rate</th><th class="num" title="Daily rate ÷ 8; for monthly staff, derived from the DOLE EEMR daily-rate equivalent ÷ 8">Per hour (₱)</th>
+              <th class="num" title="Monthly-rate only — rough estimate off the nominal monthly rate, not an actual cutoff. See Payroll Processing for the real per-cutoff figure.">Taxable (est., ₱)</th>
+              <th class="num" title="Monthly-rate only — SSS/PhilHealth/Pag-IBIG employee share + de minimis, estimated off the nominal monthly rate.">Non-taxable (est., ₱)</th>
+              <th>Status</th><th></th>
             </tr>
           </thead>
           <tbody id="employees-tbody">
-            <tr><td colspan="7" class="empty">Loading…</td></tr>
+            <tr><td colspan="10" class="empty">Loading…</td></tr>
           </tbody>
         </table>
       </div>
@@ -3122,6 +3170,8 @@
               <th>Employee</th><th>Unpaid days</th><th>OT hours</th>
               <th>Holiday pay (₱)</th><th>Rest day pay (₱)</th><th>NSD pay (₱)</th><th>Other earnings (₱)</th>
               <th title="From the Adjustments menu">Adjustments (₱)</th>
+              <th class="num" title="Gross pay minus this cutoff's SSS/PhilHealth/Pag-IBIG employee-share contributions and de minimis">Taxable (₱)</th>
+              <th class="num" title="This cutoff's SSS/PhilHealth/Pag-IBIG employee-share contributions plus de minimis">Non-taxable (₱)</th>
               <th class="num">Gross</th><th class="num">Deductions</th><th class="num">Net pay</th>
             </tr>
           </thead>
