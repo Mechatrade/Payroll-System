@@ -80,6 +80,7 @@
       loadPeriods();
       loadEmployeesForProcessing();
       loadHolidays();
+      loadAdjustments();
       renderSettingsForm();
     }
   });
@@ -362,6 +363,7 @@
     document.getElementById('manual-att-status').addEventListener('change', updateManualAttTimeRequirement);
     document.getElementById('att-period-select').addEventListener('change', () => loadManualEntries());
     document.getElementById('holiday-form').addEventListener('submit', addHoliday);
+    document.getElementById('adjustment-form').addEventListener('submit', addAdjustment);
     document.getElementById('manual-att-status').innerHTML = ATTENDANCE_STATUSES.map(s =>
       `<option value="${s.value}">${s.label}</option>`).join('');
     updateManualAttTimeRequirement();
@@ -770,9 +772,15 @@
     },
 
     // Full record for one employee in one payroll period.
-    // inputs (monthly-rate): { otHours, otMultiplier, holidayPay, restDayPay, nsdPay, otherEarnings, unpaidDays, otherDeductions }
-    // inputs (daily-rate):   { otHours, otMultiplier, holidayPay, restDayPay, nsdPay, otherEarnings, payableDays, otherDeductions }
+    // inputs (monthly-rate): { otHours, otMultiplier, holidayPay, restDayPay, nsdPay, otherEarnings, unpaidDays, otherDeductions, adjustmentEarnings, adjustmentDeductions, adjustmentItems }
+    // inputs (daily-rate):   { otHours, otMultiplier, holidayPay, restDayPay, nsdPay, otherEarnings, payableDays, otherDeductions, adjustmentEarnings, adjustmentDeductions, adjustmentItems }
     // otMultiplier: blended DOLE-stacked OT rate from otMultiplierForDays() — defaults to plain 125% (Art. 87) when not supplied.
+    // adjustmentEarnings/adjustmentDeductions: totals from the Adjustments menu for this
+    // employee+period (manual corrections with a recorded reason — back pay, a one-off
+    // bonus, recovering an earlier overpayment, etc). Kept separate from the free-text
+    // "Other earnings/deductions" cells so every adjustment carries an auditable reason;
+    // adjustmentItems is the raw list (each {type, amount, reason}), passed through
+    // untouched for the payslip to itemize.
     computeRecord(employee, inputs, period) {
       const ot = this.overtimePay(employee, inputs.otHours || 0, 8, inputs.otMultiplier || 1.25);
       const holidayPay = inputs.holidayPay || 0;
@@ -780,6 +788,9 @@
       const nsdPay = inputs.nsdPay || 0;
       const otherEarnings = inputs.otherEarnings || 0;
       const otherDeductions = inputs.otherDeductions || 0;
+      const adjustmentEarnings = inputs.adjustmentEarnings || 0;
+      const adjustmentDeductions = inputs.adjustmentDeductions || 0;
+      const adjustmentItems = inputs.adjustmentItems || [];
 
       let basic, unpaidDeduction = 0;
       if (employee.rate_type === 'monthly') {
@@ -794,7 +805,7 @@
       // a monthly-rate employee's salary doesn't cover a worked rest day
       // any more than a daily-rate one's does. See computeSpecialDayPay for
       // how these amounts get pre-filled.
-      let gross = basic - unpaidDeduction + ot + holidayPay + restDayPay + nsdPay + otherEarnings;
+      let gross = basic - unpaidDeduction + ot + holidayPay + restDayPay + nsdPay + otherEarnings + adjustmentEarnings;
 
       // Actual basic pay earned THIS cutoff, net of unpaid days — not the
       // `basic` above, which for monthly-rate employees is still the nominal
@@ -823,7 +834,7 @@
       const taxableIncome = Math.max(monthlyComp - (this.sssEmployeeShare(monthlyComp) + this.philhealthEmployeeShare(monthlyComp) + this.pagibigEmployeeShare(monthlyComp)), 0);
       const tax = this.withholdingTax(taxableIncome) * statutoryMultiplier;
 
-      const totalDeductions = sss + philhealth + pagibig + tax + otherDeductions;
+      const totalDeductions = sss + philhealth + pagibig + tax + otherDeductions + adjustmentDeductions;
       const grossRaw = gross;
       gross = Math.max(gross, 0);
       const netRaw = gross - totalDeductions;
@@ -834,7 +845,8 @@
         basic, ot, holidayPay, restDayPay, nsdPay, otherEarnings,
         unpaidDeduction,
         gross, grossRaw, sss, sssEmployer, sssEC, philhealth, philhealthEmployer, pagibig, pagibigEmployer, tax,
-        otherDeductions, totalDeductions, net, netRaw, needsReview,
+        otherDeductions, adjustmentEarnings, adjustmentDeductions, adjustmentItems,
+        totalDeductions, net, netRaw, needsReview,
         contributionMonth: this.contributionMonth(period), cutoffPosition
       };
     }
@@ -953,6 +965,124 @@
       if (h.type === 'special_non_working') return rest ? 'special_rest_day' : 'special_non_working';
     }
     return rest ? 'rest_day' : 'regular';
+  }
+
+  // ---------- Payroll adjustments (manual corrections to a future, not-yet-paid cutoff) ----------
+  // Confirmed workflow: an already-paid (released) cutoff is never edited after the
+  // fact — a missed amount from a prior period is corrected by adding it here against
+  // the NEXT cutoff instead, with a reason recorded for the audit trail. Each row is
+  // one earning or deduction tied to one employee + one target period; Payroll
+  // Processing sums these in automatically (see renderProcessingTable) every time that
+  // period is (re)computed, and the reason prints on the payslip as its own line.
+  const ADJUSTMENT_TYPE_LABELS = { earning: 'Addition (+)', deduction: 'Deduction (−)' };
+  let adjustmentsCache = [];
+
+  function loadAdjustments() {
+    const q = query(collection(db, 'adjustments'), orderBy('created_at', 'desc'));
+    onSnapshot(q, (snap) => {
+      adjustmentsCache = [];
+      snap.forEach(d => adjustmentsCache.push({ id: d.id, ...d.data() }));
+      renderAdjustmentsTable();
+    });
+  }
+
+  function populateAdjustmentSelects() {
+    const empSel = document.getElementById('adj-employee');
+    const perSel = document.getElementById('adj-period');
+    if (empSel) {
+      const current = empSel.value;
+      const active = employeesCache.filter(e => e.status === 'active');
+      empSel.innerHTML = active.map(e => `<option value="${e.id}">${e.name}</option>`).join('') || '<option value="">No active employees yet</option>';
+      if (current && active.find(e => e.id === current)) empSel.value = current;
+    }
+    if (perSel) {
+      const current = perSel.value;
+      // Newest-first, so an upcoming/draft cutoff (the normal target for a
+      // correction) is easy to find without hunting through old ones.
+      const sorted = [...periodsCache].sort((a, b) => b.cutoff_start.localeCompare(a.cutoff_start));
+      perSel.innerHTML = sorted.map(p => `<option value="${p.id}">${p.cutoff_start} – ${p.cutoff_end} (${p.status})</option>`).join('') || '<option value="">No payroll periods yet</option>';
+      if (current && sorted.find(p => p.id === current)) perSel.value = current;
+      updateAdjustmentPeriodWarning();
+    }
+  }
+
+  function updateAdjustmentPeriodWarning() {
+    const perSel = document.getElementById('adj-period');
+    const warn = document.getElementById('adj-period-warning');
+    if (!perSel || !warn) return;
+    const period = periodsCache.find(p => p.id === perSel.value);
+    const isPaidOut = period && (period.status === 'released' || period.status === 'approved');
+    warn.classList.toggle('hidden', !isPaidOut);
+  }
+
+  function renderAdjustmentsTable() {
+    const tbody = document.getElementById('adjustments-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = adjustmentsCache.map(a => {
+      const emp = employeesCache.find(e => e.id === a.employee_id);
+      const period = periodsCache.find(p => p.id === a.period_id);
+      const isPaidOut = period && (period.status === 'released' || period.status === 'approved');
+      return `
+        <tr>
+          <td>${emp ? emp.name : a.employee_id}</td>
+          <td>${period ? `${period.cutoff_start} – ${period.cutoff_end}` : a.period_id}${isPaidOut ? ` <span class="tag" style="border-color:var(--gold); color:var(--gold);" title="This cutoff is already ${period.status} — reprocess it in Payroll Processing for this to take effect, or target a later cutoff instead.">⚠ ${period.status}</span>` : ''}</td>
+          <td>${ADJUSTMENT_TYPE_LABELS[a.type] || a.type}</td>
+          <td style="text-align:right; font-family:'IBM Plex Mono',monospace;">₱${(a.amount || 0).toLocaleString('en-PH', {minimumFractionDigits: 2})}</td>
+          <td>${a.reason || '—'}</td>
+          <td style="color:var(--muted); font-size:12px;">${a.created_by || '—'}</td>
+          <td><button class="btn-icon" onclick='__mpDeleteAdjustment("${a.id}")'>Delete</button></td>
+        </tr>`;
+    }).join('') || '<tr><td colspan="7" class="empty">No adjustments recorded yet.</td></tr>';
+  }
+
+  async function addAdjustment(e) {
+    e.preventDefault();
+    const employeeId = document.getElementById('adj-employee').value;
+    const periodId = document.getElementById('adj-period').value;
+    const type = document.getElementById('adj-type').value;
+    const amount = parseFloat(document.getElementById('adj-amount').value);
+    const reason = document.getElementById('adj-reason').value.trim();
+    if (!employeeId || !periodId) { alert('Choose an employee and a target payroll period.'); return; }
+    if (!amount || amount <= 0) { alert('Enter an amount greater than ₱0.'); return; }
+    if (!reason) { alert('A reason is required — it prints on the payslip and is the audit trail for this adjustment.'); return; }
+
+    const btn = document.getElementById('adj-save-btn');
+    btn.disabled = true;
+    btn.textContent = 'Saving…';
+    try {
+      await addDoc(collection(db, 'adjustments'), {
+        employee_id: employeeId,
+        period_id: periodId,
+        type,
+        amount,
+        reason,
+        created_by: auth.currentUser ? auth.currentUser.email : null,
+        created_at: serverTimestamp()
+      });
+      document.getElementById('adjustment-form').reset();
+      populateAdjustmentSelects();
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Add adjustment';
+    }
+  }
+
+  window.__mpDeleteAdjustment = async (id) => {
+    if (!confirm('Remove this adjustment? It will no longer be included the next time its target period is processed.')) return;
+    await deleteDoc(doc(db, 'adjustments', id));
+  };
+
+  // Aggregates every adjustment targeting one employee+period into the shape
+  // computeRecord() expects, for Payroll Processing to fold in automatically.
+  function getAdjustmentsFor(employeeId, periodId) {
+    const items = adjustmentsCache.filter(a => a.employee_id === employeeId && a.period_id === periodId);
+    let earnings = 0, deductions = 0;
+    items.forEach(a => { if (a.type === 'deduction') deductions += a.amount || 0; else earnings += a.amount || 0; });
+    return {
+      adjustmentEarnings: Math.round(earnings * 100) / 100,
+      adjustmentDeductions: Math.round(deductions * 100) / 100,
+      adjustmentItems: items.map(a => ({ type: a.type, amount: a.amount || 0, reason: a.reason || '' }))
+    };
   }
 
   function dateRangeInclusive(startStr, endStr) {
@@ -1561,6 +1691,8 @@
       renderApprovalList();
       populatePayslipPeriodSelect();
       populateReportPeriodSelect();
+      populateAdjustmentSelects();
+      renderAdjustmentsTable();
     });
   }
 
@@ -1600,8 +1732,9 @@
       const ot = snap ? snap.ot_hours : 0;
       const premium = snap ? window.__mpCalc.computeSpecialDayPay(snap.days, emp) : { holidayPay: 0, restDayPay: 0, nsdPay: 0 };
       const otMultiplier = snap ? window.__mpCalc.otMultiplierForDays(snap.days, emp) : 1.25;
+      const adj = getAdjustmentsFor(emp.id, currentPeriodId);
       return `
-        <tr data-emp-id="${emp.id}" data-rate-type="monthly" data-ot-multiplier="${otMultiplier}">
+        <tr data-emp-id="${emp.id}" data-rate-type="monthly" data-ot-multiplier="${otMultiplier}" data-adj-earnings="${adj.adjustmentEarnings}" data-adj-deductions="${adj.adjustmentDeductions}" data-adj-items='${JSON.stringify(adj.adjustmentItems).replace(/'/g, "&#39;")}'>
           <td>${emp.name}<div style="font-size:11px;color:var(--muted);">₱${emp.rate_amount}/mo${snap ? ' · from attendance records' : ''}</div></td>
           <td><input type="number" class="cell-input" data-field="unpaidDays" value="${unpaidDays}" min="0" step="0.5" style="width:56px;"></td>
           <td><input type="number" class="cell-input" data-field="otHours" value="${ot}" min="0" step="0.5" style="width:56px;"></td>
@@ -1609,6 +1742,7 @@
           <td><input type="number" class="cell-input" data-field="restDayPay" value="${premium.restDayPay}" min="0" step="0.01" style="width:70px;"></td>
           <td><input type="number" class="cell-input" data-field="nsdPay" value="${premium.nsdPay}" min="0" step="0.01" style="width:70px;"></td>
           <td><input type="number" class="cell-input" data-field="otherEarnings" value="0" min="0" step="0.01" style="width:70px;"></td>
+          <td class="num" style="font-size:11px;" title="From the Adjustments menu — edit there, not here.">${adj.adjustmentItems.length ? `${adj.adjustmentEarnings > 0 ? '+₱' + adj.adjustmentEarnings.toLocaleString('en-PH') : ''}${adj.adjustmentDeductions > 0 ? ' −₱' + adj.adjustmentDeductions.toLocaleString('en-PH') : ''}` : '—'}</td>
           <td class="num result-gross">—</td>
           <td class="num result-deductions">—</td>
           <td class="num result-net">—</td>
@@ -1621,8 +1755,9 @@
       const ot = snap ? snap.ot_hours : 0;
       const premium = snap ? window.__mpCalc.computeSpecialDayPay(snap.days, emp) : { holidayPay: 0, restDayPay: 0, nsdPay: 0 };
       const otMultiplier = snap ? window.__mpCalc.otMultiplierForDays(snap.days, emp) : 1.25;
+      const adj = getAdjustmentsFor(emp.id, currentPeriodId);
       return `
-        <tr data-emp-id="${emp.id}" data-rate-type="daily" data-ot-multiplier="${otMultiplier}">
+        <tr data-emp-id="${emp.id}" data-rate-type="daily" data-ot-multiplier="${otMultiplier}" data-adj-earnings="${adj.adjustmentEarnings}" data-adj-deductions="${adj.adjustmentDeductions}" data-adj-items='${JSON.stringify(adj.adjustmentItems).replace(/'/g, "&#39;")}'>
           <td>${emp.name}<div style="font-size:11px;color:var(--muted);">₱${emp.rate_amount}/day${snap ? ' · from attendance records' : ''}</div></td>
           <td><input type="number" class="cell-input" data-field="payableDays" value="${days}" min="0" step="0.5" style="width:56px;"></td>
           <td><input type="number" class="cell-input" data-field="otHours" value="${ot}" min="0" step="0.5" style="width:56px;"></td>
@@ -1630,14 +1765,15 @@
           <td><input type="number" class="cell-input" data-field="restDayPay" value="${premium.restDayPay}" min="0" step="0.01" style="width:70px;"></td>
           <td><input type="number" class="cell-input" data-field="nsdPay" value="${premium.nsdPay}" min="0" step="0.01" style="width:70px;"></td>
           <td><input type="number" class="cell-input" data-field="otherEarnings" value="0" min="0" step="0.01" style="width:70px;"></td>
+          <td class="num" style="font-size:11px;" title="From the Adjustments menu — edit there, not here.">${adj.adjustmentItems.length ? `${adj.adjustmentEarnings > 0 ? '+₱' + adj.adjustmentEarnings.toLocaleString('en-PH') : ''}${adj.adjustmentDeductions > 0 ? ' −₱' + adj.adjustmentDeductions.toLocaleString('en-PH') : ''}` : '—'}</td>
           <td class="num result-gross">—</td>
           <td class="num result-deductions">—</td>
           <td class="num result-net">—</td>
         </tr>`;
     }).join('');
 
-    document.getElementById('processing-tbody-monthly').innerHTML = monthlyRows || `<tr><td colspan="10" class="empty">No active monthly-rate employees.</td></tr>`;
-    document.getElementById('processing-tbody-daily').innerHTML = dailyRows || `<tr><td colspan="10" class="empty">No active daily-rate employees.</td></tr>`;
+    document.getElementById('processing-tbody-monthly').innerHTML = monthlyRows || `<tr><td colspan="11" class="empty">No active monthly-rate employees.</td></tr>`;
+    document.getElementById('processing-tbody-daily').innerHTML = dailyRows || `<tr><td colspan="11" class="empty">No active daily-rate employees.</td></tr>`;
 
     document.querySelectorAll('#processing-tbody-monthly .cell-input, #processing-tbody-daily .cell-input')
       .forEach(inp => inp.addEventListener('input', () => recomputeRow(inp.closest('tr'), period)));
@@ -1651,17 +1787,21 @@
     if (!emp || !period) return;
     const val = (field) => parseFloat(tr.querySelector(`[data-field="${field}"]`)?.value || 0);
     const otMultiplier = parseFloat(tr.dataset.otMultiplier) || 1.25;
+    const adjustmentEarnings = parseFloat(tr.dataset.adjEarnings) || 0;
+    const adjustmentDeductions = parseFloat(tr.dataset.adjDeductions) || 0;
+    let adjustmentItems = [];
+    try { adjustmentItems = JSON.parse(tr.dataset.adjItems || '[]'); } catch (e) { adjustmentItems = []; }
 
     const inputs = emp.rate_type === 'monthly'
       ? {
           unpaidDays: val('unpaidDays'), otHours: val('otHours'), otMultiplier,
           holidayPay: val('holidayPay'), restDayPay: val('restDayPay'), nsdPay: val('nsdPay'),
-          otherEarnings: val('otherEarnings')
+          otherEarnings: val('otherEarnings'), adjustmentEarnings, adjustmentDeductions, adjustmentItems
         }
       : {
           payableDays: val('payableDays'), otHours: val('otHours'), otMultiplier,
           holidayPay: val('holidayPay'), restDayPay: val('restDayPay'), nsdPay: val('nsdPay'),
-          otherEarnings: val('otherEarnings')
+          otherEarnings: val('otherEarnings'), adjustmentEarnings, adjustmentDeductions, adjustmentItems
         };
 
     const rec = window.__mpCalc.computeRecord(emp, inputs, period);
@@ -1834,6 +1974,14 @@
     const line = (label, value, negative) => `
       <tr><td>${label}</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace;">${negative ? '−' : ''}₱${f(value)}</td></tr>`;
 
+    // Each recorded adjustment prints as its own labeled line (with its reason) rather
+    // than folding invisibly into a lump sum, so the payslip carries the audit trail.
+    const adjustmentItems = rec.adjustmentItems || [];
+    const adjustmentEarningRows = adjustmentItems.filter(a => a.type !== 'deduction')
+      .map(a => line(`Adjustment — ${a.reason}`, a.amount)).join('');
+    const adjustmentDeductionRows = adjustmentItems.filter(a => a.type === 'deduction')
+      .map(a => line(`Adjustment — ${a.reason}`, a.amount, true)).join('');
+
     const earningsRows = emp.rate_type === 'monthly'
       ? [
           line('Semi-monthly base (Monthly ÷ 2)', rec.basic),
@@ -1873,6 +2021,7 @@
         <thead><tr><th colspan="2" style="text-align:left;">Earnings</th></tr></thead>
         <tbody>
           ${earningsRows}
+          ${adjustmentEarningRows}
           ${unpaidRow}
         </tbody>
         <tfoot><tr><td>Gross pay</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace;">₱${f(rec.gross)}</td></tr></tfoot>
@@ -1885,6 +2034,7 @@
           ${line('Pag-IBIG', rec.pagibig, true)}
           ${line('Withholding tax', rec.tax, true)}
           ${line('Other deductions', rec.otherDeductions, true)}
+          ${adjustmentDeductionRows}
         </tbody>
         <tfoot><tr><td>Total deductions</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace;">−₱${f(rec.totalDeductions)}</td></tr></tfoot>
       </table>
@@ -2147,6 +2297,8 @@
       employeesCache = [];
       snap.forEach(d => employeesCache.push({ id: d.id, ...d.data() }));
       populateManualAttEmployeeSelect();
+      populateAdjustmentSelects();
+      renderAdjustmentsTable();
     });
   }
 </script>
@@ -2634,6 +2786,7 @@
     <button class="nav-item" data-target="view-employees">Employees</button>
     <button class="nav-item" data-target="view-attendance">Attendance</button>
     <button class="nav-item" data-target="view-holidays">Holidays</button>
+    <button class="nav-item" data-target="view-adjustments">Adjustments</button>
     <button class="nav-item" data-target="view-processing">Payroll Processing</button>
     <button class="nav-item" data-target="view-approval">Approval</button>
     <button class="nav-item" data-target="view-payslip">Payslips</button>
@@ -2871,6 +3024,50 @@
         </table>
       </div>
     </section>
+    <section id="view-adjustments" class="view hidden">
+      <div class="panel">
+        <h3>Add payroll adjustment</h3>
+        <div class="panel-sub">A manual correction (addition or deduction) tied to one employee and one payroll period. Use this instead of editing an already-paid cutoff — target the next, not-yet-released period, and give a reason; it prints on that employee's payslip as its own line for the audit trail.</div>
+        <form id="adjustment-form" class="form-grid" style="grid-template-columns: 1.3fr 1.6fr 1fr 1fr 1.6fr; align-items: end;">
+          <div class="field">
+            <label for="adj-employee">Employee</label>
+            <select id="adj-employee" required style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+          </div>
+          <div class="field">
+            <label for="adj-period">Target payroll period</label>
+            <select id="adj-period" required onchange="updateAdjustmentPeriodWarning()" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+          </div>
+          <div class="field">
+            <label for="adj-type">Type</label>
+            <select id="adj-type" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;">
+              <option value="earning">Addition (+)</option>
+              <option value="deduction">Deduction (−)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="adj-amount">Amount (₱)</label>
+            <input type="number" id="adj-amount" min="0.01" step="0.01" required>
+          </div>
+          <div class="field">
+            <label for="adj-reason">Reason (required — prints on payslip)</label>
+            <input type="text" id="adj-reason" placeholder="e.g. Back pay for missed OT, Mar 3–5 cutoff" required>
+          </div>
+          <div id="adj-period-warning" class="hidden" style="grid-column: 1 / -1; font-size:12.5px; color:var(--gold); background:#F7EFDE; border:1px solid #E4D5AC; padding:8px 12px; border-radius:4px;">
+            ⚠ This period is already processed/released. This adjustment will only take effect once that period is reprocessed in Payroll Processing — an already-paid cutoff's saved numbers are never changed automatically.
+          </div>
+          <div style="grid-column: 1 / -1;">
+            <button type="submit" id="adj-save-btn" class="btn-add">Add adjustment</button>
+          </div>
+        </form>
+      </div>
+      <div class="panel">
+        <h3>Recorded adjustments</h3>
+        <table>
+          <thead><tr><th>Employee</th><th>Target period</th><th>Type</th><th>Amount</th><th>Reason</th><th>Added by</th><th></th></tr></thead>
+          <tbody id="adjustments-tbody"><tr><td colspan="7" class="empty">No adjustments recorded yet.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
     <section id="view-processing" class="view hidden">
       <div class="panel">
         <h3>New payroll period</h3>
@@ -2924,6 +3121,7 @@
             <tr>
               <th>Employee</th><th>Unpaid days</th><th>OT hours</th>
               <th>Holiday pay (₱)</th><th>Rest day pay (₱)</th><th>NSD pay (₱)</th><th>Other earnings (₱)</th>
+              <th title="From the Adjustments menu">Adjustments (₱)</th>
               <th class="num">Gross</th><th class="num">Deductions</th><th class="num">Net pay</th>
             </tr>
           </thead>
@@ -2939,6 +3137,7 @@
             <tr>
               <th>Employee</th><th>Payable days</th><th>OT hours</th>
               <th>Holiday pay (₱)</th><th>Rest day pay (₱)</th><th>NSD pay (₱)</th><th>Other earnings (₱)</th>
+              <th title="From the Adjustments menu">Adjustments (₱)</th>
               <th class="num">Gross</th><th class="num">Deductions</th><th class="num">Net pay</th>
             </tr>
           </thead>
