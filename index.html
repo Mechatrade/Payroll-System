@@ -1582,13 +1582,13 @@
       const flagsHtml = buildPayFlagsHtml(r);
       return `
         <tr>
-          <td>${emp ? emp.name : r.employee_id}</td>
-          <td style="color:var(--muted);">${r.date}</td>
-          <td>${fmtTime(r.time_in)}</td>
-          <td>${fmtTime(r.time_out)}</td>
-          <td>${statusLabel(r.attendance_status)}${r.is_leave ? ' <span class="tag" style="border-color:var(--red); color:var(--red);">Leave</span>' : ''}</td>
-          <td>${flagsHtml || '<span style="color:var(--muted); font-size:11px;">—</span>'}</td>
-          <td>
+          <td style="white-space:nowrap;">${emp ? emp.name : r.employee_id}</td>
+          <td style="color:var(--muted); white-space:nowrap;">${r.date}</td>
+          <td style="white-space:nowrap;">${fmtTime(r.time_in)}</td>
+          <td style="white-space:nowrap;">${fmtTime(r.time_out)}</td>
+          <td style="white-space:nowrap;">${statusLabel(r.attendance_status)}${r.is_leave ? ' <span class="tag" style="border-color:var(--red); color:var(--red);">Leave</span>' : ''}</td>
+          <td style="white-space:nowrap;">${flagsHtml || '<span style="color:var(--muted); font-size:11px;">—</span>'}</td>
+          <td style="white-space:nowrap;">
             <button class="btn-icon" style="color:var(--navy);" onclick='__mpEditManualEntry("${r.id}")'>Edit</button>
             <button class="btn-icon" style="margin-left:10px;" onclick='__mpDeleteManualEntry("${r.id}")'>Delete</button>
           </td>
