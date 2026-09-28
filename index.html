@@ -2537,7 +2537,7 @@
   /* ---------- Attendance: two-column layout (pull/pulled-records left, manual entry right) ---------- */
   .attendance-grid {
     display: grid;
-    grid-template-columns: 1.3fr 1fr;
+    grid-template-columns: 1fr 1fr;
     gap: 24px;
     align-items: start;
   }
@@ -2984,9 +2984,9 @@
         <div class="panel-sub" style="margin-top:6px;">Leave a whole day out of time in/out and pick a status (e.g. Paid Leave) instead — hours are left at 0 for those days.</div>
 
         <div style="overflow-x:auto; margin-top:18px;">
-        <table>
+        <table style="min-width:640px;">
           <thead><tr>
-            <th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th><th>Status</th><th>Pay flags</th><th>Actions</th>
+            <th style="white-space:nowrap;">Employee</th><th style="white-space:nowrap;">Date</th><th style="white-space:nowrap;">Time In</th><th style="white-space:nowrap;">Time Out</th><th style="white-space:nowrap;">Status</th><th style="white-space:nowrap;">Pay flags</th><th style="white-space:nowrap;">Actions</th>
           </tr></thead>
           <tbody id="manual-att-tbody"><tr><td colspan="7" class="empty">Select a payroll period above.</td></tr></tbody>
         </table>
