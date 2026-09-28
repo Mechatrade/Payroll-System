@@ -898,8 +898,11 @@
       // Withholding tax now follows the SAME first/second-cutoff rule as
       // SSS/PhilHealth/Pag-IBIG (confirmed policy: zero deduction of any kind
       // on the first cutoff, full monthly amount on the second) — no longer
-      // split 50/50 across both cutoffs.
-      const taxableIncome = Math.max(monthlyComp - (this.sssEmployeeShare(taxableMonthlyComp) + this.philhealthEmployeeShare(taxableMonthlyComp) + this.pagibigEmployeeShare(monthlyComp)), 0);
+      // split 50/50 across both cutoffs. The starting base is also the
+      // TAXABLE salary only (taxableMonthlyComp), same as SSS/PhilHealth —
+      // the fixed Non-taxable portion is excluded before the BIR brackets
+      // are ever applied, then SSS/PhilHealth/Pag-IBIG are subtracted as usual.
+      const taxableIncome = Math.max(taxableMonthlyComp - (this.sssEmployeeShare(taxableMonthlyComp) + this.philhealthEmployeeShare(taxableMonthlyComp) + this.pagibigEmployeeShare(monthlyComp)), 0);
       const tax = this.withholdingTax(taxableIncome) * statutoryMultiplier;
 
       const totalDeductions = sss + philhealth + pagibig + tax + otherDeductions + adjustmentDeductions;
