@@ -871,8 +871,25 @@
       const sss = this.sssEmployeeShare(monthlyComp) * statutoryMultiplier;
       const sssEmployer = this.sssEmployerShare(monthlyComp) * statutoryMultiplier;
       const sssEC = this.sssEC(monthlyComp) * statutoryMultiplier;
-      const philhealth = this.philhealthEmployeeShare(monthlyComp) * statutoryMultiplier;
-      const philhealthEmployer = this.philhealthEmployerShare(monthlyComp) * statutoryMultiplier;
+
+      // PhilHealth's 2.5% employee share is based on the employee's TAXABLE
+      // salary only (the Taxable amount entered on the employee record) —
+      // the fixed Non-taxable portion is excluded from this base entirely.
+      // Prorated the same way `basic` is: scaled down if unpaid days reduced
+      // what was actually earned this cutoff (and zeroed out by
+      // statutoryMultiplier below when nothing was earned at all). Daily-rate
+      // employees have no Taxable/Non-taxable split, so this is unchanged
+      // for them — philhealthMonthlyComp just equals the regular monthlyComp.
+      let philhealthMonthlyComp = monthlyComp;
+      if (employee.rate_type === 'monthly') {
+        const nominalBasic = employee.rate_amount / 2;
+        const earnedFraction = nominalBasic > 0 ? basicEarned / nominalBasic : 0;
+        const taxableNominal = (employee.taxable_amount ?? employee.rate_amount ?? 0) / 2;
+        philhealthMonthlyComp = this.actualMonthlyComp(taxableNominal * earnedFraction, period);
+      }
+      const philhealth = this.philhealthEmployeeShare(philhealthMonthlyComp) * statutoryMultiplier;
+      const philhealthEmployer = this.philhealthEmployerShare(philhealthMonthlyComp) * statutoryMultiplier;
+
       const pagibig = this.pagibigEmployeeShare(monthlyComp) * statutoryMultiplier;
       const pagibigEmployer = this.pagibigEmployerShare(monthlyComp) * statutoryMultiplier;
 
@@ -880,7 +897,7 @@
       // SSS/PhilHealth/Pag-IBIG (confirmed policy: zero deduction of any kind
       // on the first cutoff, full monthly amount on the second) — no longer
       // split 50/50 across both cutoffs.
-      const taxableIncome = Math.max(monthlyComp - (this.sssEmployeeShare(monthlyComp) + this.philhealthEmployeeShare(monthlyComp) + this.pagibigEmployeeShare(monthlyComp)), 0);
+      const taxableIncome = Math.max(monthlyComp - (this.sssEmployeeShare(monthlyComp) + this.philhealthEmployeeShare(philhealthMonthlyComp) + this.pagibigEmployeeShare(monthlyComp)), 0);
       const tax = this.withholdingTax(taxableIncome) * statutoryMultiplier;
 
       const totalDeductions = sss + philhealth + pagibig + tax + otherDeductions + adjustmentDeductions;
