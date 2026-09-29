@@ -242,11 +242,15 @@
     document.getElementById('taxcalc-out-tax').textContent = '₱' + f(tax);
 
     const brackets = STATUTORY_2026.taxMonthly;
-    let bracketIdx = 0;
-    brackets.forEach((b, i) => { if (taxableIncome >= b.floor) bracketIdx = i; });
     const note = rateType === 'daily'
       ? `Statutory base = ₱${f(inputVal)}/day × 26 = ₱${f(monthlyComp)}/mo. `
       : '';
+    if (!brackets || !brackets.length) {
+      document.getElementById('taxcalc-bracket-note').textContent = note + 'No tax brackets configured in Settings — withholding tax is ₱0 for everyone until at least one bracket is added.';
+      return;
+    }
+    let bracketIdx = 0;
+    brackets.forEach((b, i) => { if (taxableIncome >= b.floor) bracketIdx = i; });
     document.getElementById('taxcalc-bracket-note').textContent =
       note + `Falls in bracket: ${bracketRangeLabel(brackets, bracketIdx, 1)} (₱${f(brackets[bracketIdx].base)} + ${(brackets[bracketIdx].rate * 100).toFixed(0)}% of excess over ₱${f(brackets[bracketIdx].floor)}).`;
   }
@@ -487,11 +491,16 @@
     document.getElementById('settings-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       if (currentUserRole !== 'admin') return;
+      const payload = collectSettingsPayload();
+      if (!payload.taxMonthly.length) {
+        const proceed = confirm('The withholding tax bracket table is empty — saving now will make withholding tax ₱0 for every employee on every future payroll run until at least one bracket is added back. Save anyway?');
+        if (!proceed) return;
+      }
       const btn = document.getElementById('settings-save-btn');
       btn.disabled = true;
       btn.textContent = 'Saving…';
       try {
-        await saveStatutorySettings(collectSettingsPayload());
+        await saveStatutorySettings(payload);
         renderSettingsForm();
         renderTaxTable();
         alert('Settings saved. New computations will use these values immediately.');
@@ -736,6 +745,9 @@
     },
     withholdingTax(monthlyTaxableIncome) {
       const brackets = STATUTORY_2026.taxMonthly;
+      // No brackets configured (e.g. an admin deleted every row in Settings) —
+      // treat as no withholding tax rather than crashing Processing/Payslips.
+      if (!brackets || !brackets.length) return 0;
       let bracket = brackets[0];
       for (const b of brackets) { if (monthlyTaxableIncome >= b.floor) bracket = b; }
       const tax = bracket.base + (monthlyTaxableIncome - bracket.floor) * bracket.rate;
@@ -915,12 +927,18 @@
       const pagibig = this.pagibigEmployeeShare(monthlyComp) * statutoryMultiplier;
       const pagibigEmployer = this.pagibigEmployerShare(monthlyComp) * statutoryMultiplier;
 
-      // Withholding tax now follows the SAME first/second-cutoff rule as
-      // SSS/PhilHealth/Pag-IBIG (confirmed policy: zero deduction of any kind
-      // on the first cutoff, full monthly amount on the second) — no longer
-      // split 50/50 across both cutoffs.
+      // Withholding tax is entered manually per employee, per cutoff (Payroll
+      // Processing's "Tax (₱)" field) rather than computed from the bracket
+      // table in Settings — the admin types in the amount from their own BIR
+      // computation. It still follows the SAME first/second-cutoff rule as
+      // SSS/PhilHealth/Pag-IBIG (zeroed on a first cutoff, applied in full on
+      // the second) so a figure left in the field doesn't silently charge on
+      // a cutoff that shouldn't carry any statutory deduction.
+      // taxableIncome is kept around (unused by `tax` itself) because the Tax
+      // Computation calculator and payslip breakdown still reference the
+      // bracket-based figure as a reference/cross-check, not as the deduction.
       const taxableIncome = Math.max(monthlyComp - (this.sssEmployeeShare(monthlyComp) + this.philhealthEmployeeShare(monthlyComp) + this.pagibigEmployeeShare(monthlyComp)), 0);
-      const tax = this.withholdingTax(taxableIncome) * statutoryMultiplier;
+      const tax = Math.max(inputs.manualTax || 0, 0) * statutoryMultiplier;
 
       const totalDeductions = sss + philhealth + pagibig + tax + cashAdvanceDeduction + otherDeductions;
       const grossRaw = gross;
@@ -2113,6 +2131,7 @@
           <td><input type="number" class="cell-input" data-field="restDayPay" value="${premium.restDayPay}" min="0" step="0.01" style="width:70px;"></td>
           <td><input type="number" class="cell-input" data-field="nsdPay" value="${premium.nsdPay}" min="0" step="0.01" style="width:70px;"></td>
           <td><input type="number" class="cell-input" data-field="otherEarnings" value="0" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="manualTax" value="0" min="0" step="0.01" style="width:70px;" title="Entered manually — replaces bracket-calculated withholding tax for this cutoff."></td>
           <td><input type="number" class="cell-input" data-field="cashAdvanceDeduction" value="${caDue ? caDue.amountDue : 0}" min="0" step="0.01" style="width:75px;" title="${caDue ? 'Installment against active cash advance' : 'No active cash advance'}"></td>
           <td class="num result-gross">—</td>
           <td class="num result-deductions">—</td>
@@ -2136,6 +2155,7 @@
           <td><input type="number" class="cell-input" data-field="restDayPay" value="${premium.restDayPay}" min="0" step="0.01" style="width:70px;"></td>
           <td><input type="number" class="cell-input" data-field="nsdPay" value="${premium.nsdPay}" min="0" step="0.01" style="width:70px;"></td>
           <td><input type="number" class="cell-input" data-field="otherEarnings" value="0" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="manualTax" value="0" min="0" step="0.01" style="width:70px;" title="Entered manually — replaces bracket-calculated withholding tax for this cutoff."></td>
           <td><input type="number" class="cell-input" data-field="cashAdvanceDeduction" value="${caDue ? caDue.amountDue : 0}" min="0" step="0.01" style="width:75px;" title="${caDue ? 'Installment against active cash advance' : 'No active cash advance'}"></td>
           <td class="num result-gross">—</td>
           <td class="num result-deductions">—</td>
@@ -2143,8 +2163,8 @@
         </tr>`;
     }).join('');
 
-    document.getElementById('processing-tbody-monthly').innerHTML = monthlyRows || `<tr><td colspan="11" class="empty">No active monthly-rate employees.</td></tr>`;
-    document.getElementById('processing-tbody-daily').innerHTML = dailyRows || `<tr><td colspan="11" class="empty">No active daily-rate employees.</td></tr>`;
+    document.getElementById('processing-tbody-monthly').innerHTML = monthlyRows || `<tr><td colspan="12" class="empty">No active monthly-rate employees.</td></tr>`;
+    document.getElementById('processing-tbody-daily').innerHTML = dailyRows || `<tr><td colspan="12" class="empty">No active daily-rate employees.</td></tr>`;
 
     document.querySelectorAll('#processing-tbody-monthly .cell-input, #processing-tbody-daily .cell-input')
       .forEach(inp => inp.addEventListener('input', () => recomputeRow(inp.closest('tr'), period)));
@@ -2163,12 +2183,12 @@
       ? {
           unpaidDays: val('unpaidDays'), otHours: val('otHours'), otMultiplier,
           holidayPay: val('holidayPay'), restDayPay: val('restDayPay'), nsdPay: val('nsdPay'),
-          otherEarnings: val('otherEarnings'), cashAdvanceDeduction: val('cashAdvanceDeduction')
+          otherEarnings: val('otherEarnings'), manualTax: val('manualTax'), cashAdvanceDeduction: val('cashAdvanceDeduction')
         }
       : {
           payableDays: val('payableDays'), otHours: val('otHours'), otMultiplier,
           holidayPay: val('holidayPay'), restDayPay: val('restDayPay'), nsdPay: val('nsdPay'),
-          otherEarnings: val('otherEarnings'), cashAdvanceDeduction: val('cashAdvanceDeduction')
+          otherEarnings: val('otherEarnings'), manualTax: val('manualTax'), cashAdvanceDeduction: val('cashAdvanceDeduction')
         };
 
     const rec = window.__mpCalc.computeRecord(emp, inputs, period);
@@ -2932,15 +2952,28 @@
     font-weight: 500;
     padding: 8px 10px;
     border-bottom: 1px solid var(--line);
+    white-space: nowrap;
   }
 
   th.num, td.num { text-align: right; }
 
+  /* System-wide rule: every data table cell is a single line, never wrapped —
+     long content (names, dates, statuses, notes) pushes the table wider
+     instead of breaking mid-word. Every table below is wrapped in an
+     .table-scroll (overflow-x:auto) container so the extra width scrolls
+     horizontally rather than overflowing the page. Excluded: .sheet-table,
+     the printable Payroll Register / Payslip / Report documents — those have
+     a fixed print width (payslip prints at a fixed A5 box) where nowrap could
+     push content past the page edge and get cut off on paper instead of
+     scrolling, so they keep normal wrapping. */
   td {
     padding: 10px 10px;
     border-bottom: 1px solid var(--line);
     font-size: 13.5px;
+    white-space: nowrap;
   }
+
+  .table-scroll { overflow-x: auto; }
 
   tr:last-child td { border-bottom: none; }
 
@@ -3053,9 +3086,9 @@
   .sheet-meta div span { display: block; color: var(--muted); font-size: 11px; margin-bottom: 2px; }
 
   .sheet-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
-  .sheet-table th { text-align: right; background: var(--paper); padding: 7px 8px; border: 1px solid var(--line); font-weight: 500; color: var(--muted); }
+  .sheet-table th { text-align: right; background: var(--paper); padding: 7px 8px; border: 1px solid var(--line); font-weight: 500; color: var(--muted); white-space: normal; }
   .sheet-table th:first-child { text-align: left; }
-  .sheet-table td { padding: 7px 8px; border: 1px solid var(--line); text-align: right; font-family: 'IBM Plex Mono', monospace; }
+  .sheet-table td { padding: 7px 8px; border: 1px solid var(--line); text-align: right; font-family: 'IBM Plex Mono', monospace; white-space: normal; }
   .sheet-table td:first-child { text-align: left; font-family: 'IBM Plex Sans', sans-serif; }
   .sheet-table tfoot td { font-weight: 600; background: var(--paper); }
 
@@ -3282,6 +3315,7 @@
 
       <div class="panel">
         <h3>Employee roster</h3>
+        <div class="table-scroll">
         <table>
           <thead>
             <tr>
@@ -3293,6 +3327,7 @@
             <tr><td colspan="7" class="empty">Loading…</td></tr>
           </tbody>
         </table>
+        </div>
       </div>
     </section>
 
@@ -3439,10 +3474,12 @@
       </div>
       <div class="panel">
         <h3>Declared dates</h3>
+        <div class="table-scroll">
         <table>
           <thead><tr><th>Date</th><th>Type</th><th>Label</th><th></th></tr></thead>
           <tbody id="holidays-tbody"><tr><td colspan="4" class="empty">No holidays declared yet.</td></tr></tbody>
         </table>
+        </div>
       </div>
     </section>
 
@@ -3479,6 +3516,7 @@
 
       <div class="panel">
         <h3>Cash advance ledger</h3>
+        <div class="table-scroll">
         <table>
           <thead><tr>
             <th>Employee</th><th class="num">Amount</th><th class="num">Terms</th><th class="num">Per term</th>
@@ -3486,6 +3524,7 @@
           </tr></thead>
           <tbody id="cashadvance-tbody"><tr><td colspan="9" class="empty">No cash advances yet.</td></tr></tbody>
         </table>
+        </div>
       </div>
     </section>
 
@@ -3521,10 +3560,12 @@
 
       <div class="panel">
         <h3>Payroll periods</h3>
+        <div class="table-scroll">
         <table>
           <thead><tr><th>Cutoff</th><th>Type</th><th>Pay date</th><th>Status</th><th></th></tr></thead>
           <tbody id="periods-tbody"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
         </table>
+        </div>
       </div>
 
       <div class="panel hidden" id="processing-workspace">
@@ -3535,13 +3576,13 @@
         </div>
 
         <h3 style="font-size:14px; margin-top:24px; margin-bottom:2px;">Monthly-rate employees</h3>
-        <div class="panel-sub" style="margin-bottom:12px;">Semi-monthly Base = Monthly Salary ÷ 2, minus Unpaid Days deduction, plus OT/Holiday/Rest Day/NSD/Other Earnings. Holiday, rest day, and NSD pay are pre-filled from attendance using DOLE premium rates — override if needed.</div>
+        <div class="panel-sub" style="margin-bottom:12px;">Semi-monthly Base = Monthly Salary ÷ 2, minus Unpaid Days deduction, plus OT/Holiday/Rest Day/NSD/Other Earnings. Holiday, rest day, and NSD pay are pre-filled from attendance using DOLE premium rates — override if needed. Withholding tax is entered manually per employee, per cutoff — type in the amount from your own BIR computation; it's zeroed automatically on a first cutoff like the other statutory deductions.</div>
         <div style="overflow-x:auto;">
         <table>
           <thead>
             <tr>
               <th>Employee</th><th>Unpaid days</th><th>OT hours</th>
-              <th>Holiday pay (₱)</th><th>Rest day pay (₱)</th><th>NSD pay (₱)</th><th>Other earnings (₱)</th><th>Cash advance (₱)</th>
+              <th>Holiday pay (₱)</th><th>Rest day pay (₱)</th><th>NSD pay (₱)</th><th>Other earnings (₱)</th><th>Tax (₱)</th><th>Cash advance (₱)</th>
               <th class="num">Gross</th><th class="num">Deductions</th><th class="num">Net pay</th>
             </tr>
           </thead>
@@ -3550,13 +3591,13 @@
         </div>
 
         <h3 style="font-size:14px; margin-top:28px; margin-bottom:2px;">Daily-rate employees</h3>
-        <div class="panel-sub" style="margin-bottom:12px;">Basic Pay = Daily Rate × Payable Days, plus OT/Holiday/Rest Day/NSD/Other Earnings. Holiday, rest day, and NSD pay are pre-filled from attendance using DOLE premium rates — override if needed.</div>
+        <div class="panel-sub" style="margin-bottom:12px;">Basic Pay = Daily Rate × Payable Days, plus OT/Holiday/Rest Day/NSD/Other Earnings. Holiday, rest day, and NSD pay are pre-filled from attendance using DOLE premium rates — override if needed. Withholding tax is entered manually per employee, per cutoff — type in the amount from your own BIR computation; it's zeroed automatically on a first cutoff like the other statutory deductions.</div>
         <div style="overflow-x:auto;">
         <table>
           <thead>
             <tr>
               <th>Employee</th><th>Payable days</th><th>OT hours</th>
-              <th>Holiday pay (₱)</th><th>Rest day pay (₱)</th><th>NSD pay (₱)</th><th>Other earnings (₱)</th><th>Cash advance (₱)</th>
+              <th>Holiday pay (₱)</th><th>Rest day pay (₱)</th><th>NSD pay (₱)</th><th>Other earnings (₱)</th><th>Tax (₱)</th><th>Cash advance (₱)</th>
               <th class="num">Gross</th><th class="num">Deductions</th><th class="num">Net pay</th>
             </tr>
           </thead>
@@ -3575,10 +3616,12 @@
       <div class="panel">
         <h3>Periods awaiting or past approval</h3>
         <div class="panel-sub">Only submitted batches (status: for approval, approved, or released) appear here. Approving requires an admin account.</div>
+        <div class="table-scroll">
         <table>
           <thead><tr><th>Cutoff</th><th>Status</th><th></th></tr></thead>
           <tbody id="approval-periods-tbody"><tr><td colspan="3" class="empty">Loading…</td></tr></tbody>
         </table>
+        </div>
       </div>
 
       <div class="panel hidden" id="approval-review-wrap">
@@ -3728,20 +3771,24 @@
         <div class="panel">
           <h3>Withholding tax brackets (monthly)</h3>
           <div class="panel-sub">BIR TRAIN table. Each bracket applies once monthly taxable income reaches its floor.</div>
+          <div class="table-scroll">
           <table>
             <thead><tr><th>Floor (₱)</th><th>Base tax (₱)</th><th>Rate (%)</th><th></th></tr></thead>
             <tbody id="settings-tax-tbody"></tbody>
           </table>
+          </div>
           <button type="button" class="btn-icon" id="settings-add-tax-row" style="color:var(--navy); margin-top:10px;">+ Add bracket</button>
         </div>
 
         <div class="panel">
           <h3>Pay premium multipliers (DOLE day types)</h3>
           <div class="panel-sub">Multiplier on the daily rate for a worked day of this type, and the extra multiplier applied to OT hours on that day.</div>
+          <div class="table-scroll">
           <table>
             <thead><tr><th>Day type</th><th>Worked multiplier (×)</th><th>OT multiplier (×)</th></tr></thead>
             <tbody id="settings-daytype-tbody"></tbody>
           </table>
+          </div>
         </div>
 
         <div class="panel">
