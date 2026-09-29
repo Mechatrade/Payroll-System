@@ -2927,7 +2927,12 @@
   /* ---------- Attendance: two-column layout (pull/pulled-records left, manual entry right) ---------- */
   .attendance-grid {
     display: grid;
-    grid-template-columns: 1.3fr 1fr;
+    /* Left column (attendance tables) takes whatever space is available —
+       useful since those tables can run wide. Right column (Manual time
+       entry's form + its results table) is capped at 680px: it doesn't need
+       more than that, and letting it grow with the rest of the page just
+       stretched the card into empty whitespace on a wide window. */
+    grid-template-columns: 1fr minmax(460px, 680px);
     gap: 24px;
     align-items: start;
   }
@@ -3424,7 +3429,7 @@
 
           <div id="import-preview-wrap" class="hidden" style="margin-top:18px;">
             <div id="import-preview-summary" class="panel-sub" style="margin-bottom:10px;"></div>
-            <div style="max-height:360px; overflow-y:auto; border:1px solid var(--line);">
+            <div style="max-height:360px; overflow-y:auto; overflow-x:auto; border:1px solid var(--line);">
               <table style="min-width:720px;">
                 <thead><tr>
                   <th>Row</th><th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th><th>Status</th><th>Result</th>
