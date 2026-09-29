@@ -9,6 +9,9 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Serif:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet">
 
+<!-- SheetJS: reads .xlsx/.xls/.csv files client-side for the manual attendance Import mode, and builds the downloadable import template. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
 <!-- Firebase (v9 modular, CDN) -->
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
@@ -444,6 +447,11 @@
     document.getElementById('manual-att-cancel-btn').addEventListener('click', exitManualAttEditMode);
     document.getElementById('manual-att-status').addEventListener('change', updateManualAttTimeRequirement);
     document.getElementById('att-period-select').addEventListener('change', () => loadManualEntries());
+    document.getElementById('manual-att-mode-single').addEventListener('click', () => setManualAttMode('single'));
+    document.getElementById('manual-att-mode-import').addEventListener('click', () => setManualAttMode('import'));
+    document.getElementById('download-import-template-btn').addEventListener('click', downloadImportTemplate);
+    document.getElementById('import-att-file').addEventListener('change', handleImportFileChange);
+    document.getElementById('import-att-commit-btn').addEventListener('click', commitImportRows);
     document.getElementById('holiday-form').addEventListener('submit', addHoliday);
     document.getElementById('manual-att-status').innerHTML = ATTENDANCE_STATUSES.map(s =>
       `<option value="${s.value}">${s.label}</option>`).join('');
@@ -1382,36 +1390,28 @@
     document.getElementById('manual-att-timeout').required = needsTimes;
   }
 
-  async function saveManualAttendance(e) {
-    e.preventDefault();
-    const periodId = document.getElementById('att-period-select').value;
-    if (!periodId) { alert('Select a payroll period first (top of this page).'); return; }
-    const period = periodsCache.find(p => p.id === periodId);
-    if (!period) return;
-
-    const employeeId = document.getElementById('manual-att-employee').value;
-    const date = document.getElementById('manual-att-date').value;
-    const timeInStr = document.getElementById('manual-att-timein').value;
-    const timeOutStr = document.getElementById('manual-att-timeout').value;
-    let status = document.getElementById('manual-att-status').value;
-
-    if (!employeeId) { alert('Select an employee.'); return; }
-    if (!date) { alert('Select a date.'); return; }
+  // Shared by the single-entry form AND the bulk Import mode: validates one
+  // employee/date/time(s)/status combination against the period, and builds
+  // the exact attendance doc fields to save — so a row imported from Excel
+  // is computed with the same rules (OT split, rest-day downgrade, implied
+  // Present/Half Day) as one typed in by hand. Returns { ok:true, docId,
+  // docData } or { ok:false, error }.
+  function buildManualAttendanceEntry(employee, period, date, timeInStr, timeOutStr, status) {
+    if (!employee) return { ok: false, error: 'Employee not found' };
+    if (!period) return { ok: false, error: 'No payroll period selected' };
+    if (!date) return { ok: false, error: 'Missing or unreadable date' };
     if (date < period.cutoff_start || date > period.cutoff_end) {
-      alert(`That date is outside the selected period's cutoff (${period.cutoff_start} – ${period.cutoff_end}).`);
-      return;
+      return { ok: false, error: `Date outside period (${period.cutoff_start} – ${period.cutoff_end})` };
     }
 
     const hasTimes = !!(timeInStr && timeOutStr);
     if (!hasTimes && !status) {
-      alert('Either enter a time in/out, or choose an Attendance Status for a leave day.');
-      return;
+      return { ok: false, error: 'Needs a time in/out, or an Attendance Status for a leave day' };
     }
 
     const computed = computeManualHours(date, timeInStr, timeOutStr);
     let isLeave, regularHours = 0, otHours = 0, undertimeMinutes = 0, timeInISO = null, timeOutISO = null, nightMinutes = 0;
     let dayType = classifyDay(date);
-    const employee = employeesCache.find(e => e.id === employeeId);
 
     if (computed) {
       isLeave = false;
@@ -1425,7 +1425,7 @@
       // downgrades to 'regular' so no separate premium gets computed.
       if (dayType === 'rest_day') {
         dayType = 'regular';
-        if (employee && employee.rate_type === 'monthly') {
+        if (employee.rate_type === 'monthly') {
           regularHours = 0;
           otHours = Math.round((computed.workedMinutes / 60) * 100) / 100;
         } else {
@@ -1443,14 +1443,12 @@
       // admin can add a partial time in/out instead if they want it computed.
     }
 
-    const docId = `${periodId}_${employeeId}_${date}`;
-    const btn = document.getElementById('manual-att-save-btn');
-    btn.disabled = true;
-    btn.textContent = 'Saving…';
-    try {
-      await setDoc(doc(db, 'attendance', docId), {
-        period_id: periodId,
-        employee_id: employeeId,
+    return {
+      ok: true,
+      docId: `${period.id}_${employee.id}_${date}`,
+      docData: {
+        period_id: period.id,
+        employee_id: employee.id,
         date,
         time_in: timeInISO,
         time_out: timeOutISO,
@@ -1464,7 +1462,35 @@
         attendance_status: status || null,
         source: 'manual',
         pulled_at: serverTimestamp()
-      });
+      }
+    };
+  }
+
+  async function saveManualAttendance(e) {
+    e.preventDefault();
+    const periodId = document.getElementById('att-period-select').value;
+    if (!periodId) { alert('Select a payroll period first (top of this page).'); return; }
+    const period = periodsCache.find(p => p.id === periodId);
+    if (!period) return;
+
+    const employeeId = document.getElementById('manual-att-employee').value;
+    const date = document.getElementById('manual-att-date').value;
+    const timeInStr = document.getElementById('manual-att-timein').value;
+    const timeOutStr = document.getElementById('manual-att-timeout').value;
+    const status = document.getElementById('manual-att-status').value;
+    const employee = employeesCache.find(e => e.id === employeeId);
+
+    if (!employeeId) { alert('Select an employee.'); return; }
+    if (!date) { alert('Select a date.'); return; }
+
+    const entry = buildManualAttendanceEntry(employee, period, date, timeInStr, timeOutStr, status);
+    if (!entry.ok) { alert(entry.error + '.'); return; }
+
+    const btn = document.getElementById('manual-att-save-btn');
+    btn.disabled = true;
+    btn.textContent = 'Saving…';
+    try {
+      await setDoc(doc(db, 'attendance', entry.docId), entry.docData);
       alert(`Saved manual entry for ${employee ? employee.name : 'employee'} on ${date}.` + (manualAttEditingKey ? '' : ' Open this period in Payroll Processing to see it reflected.'));
       exitManualAttEditMode();
       document.getElementById('manual-att-form').reset();
@@ -1475,6 +1501,237 @@
     } finally {
       btn.disabled = false;
       btn.textContent = manualAttEditingKey ? 'Save changes' : 'Add entry';
+    }
+  }
+
+  // ---------- Manual entry: Import from Excel ----------
+  // Reads a spreadsheet client-side (SheetJS), matches each row to an
+  // employee and validates it with the exact same rules as a single manual
+  // entry (buildManualAttendanceEntry above), shows a preview of what will
+  // be saved and what will be skipped, and only writes to Firestore once the
+  // admin confirms.
+  let importRows = []; // staged parse results: { rowNum, rawName, dateStr, timeInStr, timeOutStr, rawStatus, employee, error, entry }
+
+  function setManualAttMode(mode) {
+    document.getElementById('manual-att-mode-single').classList.toggle('active', mode === 'single');
+    document.getElementById('manual-att-mode-import').classList.toggle('active', mode === 'import');
+    document.getElementById('manual-att-single-wrap').classList.toggle('hidden', mode !== 'single');
+    document.getElementById('manual-att-import-panel').classList.toggle('hidden', mode !== 'import');
+  }
+
+  function findImportColumn(row, aliases) {
+    const keys = Object.keys(row);
+    for (const alias of aliases) {
+      const key = keys.find(k => k.trim().toLowerCase() === alias);
+      if (key !== undefined) return key;
+    }
+    return null;
+  }
+
+  // Excel/Sheets date serial (day 0 = 1899-12-30) → 'YYYY-MM-DD', used when a
+  // cell comes through as a raw number instead of a parsed Date.
+  function excelSerialToDateKey(serial) {
+    const utcMs = Math.round((serial - 25569) * 86400 * 1000);
+    return new Date(utcMs).toISOString().slice(0, 10);
+  }
+
+  function normalizeImportDate(val) {
+    // SheetJS (cellDates:true) hands back date-only cells as a Date anchored
+    // at UTC midnight for that calendar day — read it with UTC getters, or a
+    // browser west of UTC (e.g. PH readers working from a US timezone) rolls
+    // it back a day.
+    if (val instanceof Date && !isNaN(val)) {
+      return `${val.getUTCFullYear()}-${String(val.getUTCMonth() + 1).padStart(2, '0')}-${String(val.getUTCDate()).padStart(2, '0')}`;
+    }
+    if (typeof val === 'number') return excelSerialToDateKey(val);
+    if (typeof val === 'string') {
+      const s = val.trim();
+      let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+      if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+      m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/); // MM/DD/YYYY
+      if (m) return `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`;
+      // Free-form text (e.g. "Sept 15, 2026") — JS parses this in the
+      // browser's LOCAL timezone, so read it back with local getters rather
+      // than UTC ones to avoid a second, opposite-direction shift.
+      const parsed = new Date(s);
+      if (!isNaN(parsed)) return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, '0')}-${String(parsed.getDate()).padStart(2, '0')}`;
+    }
+    return null;
+  }
+
+  // Returns 'HH:MM' (24hr), '' for a genuinely blank cell (leave day), or
+  // null if the cell has content but couldn't be read as a time.
+  function normalizeImportTime(val) {
+    if (val === '' || val === null || val === undefined) return '';
+    if (val instanceof Date && !isNaN(val)) {
+      return `${String(val.getHours()).padStart(2, '0')}:${String(val.getMinutes()).padStart(2, '0')}`;
+    }
+    if (typeof val === 'number') {
+      const totalMinutes = Math.round(val * 24 * 60);
+      return `${String(Math.floor(totalMinutes / 60) % 24).padStart(2, '0')}:${String(totalMinutes % 60).padStart(2, '0')}`;
+    }
+    if (typeof val === 'string') {
+      const s = val.trim();
+      if (!s) return '';
+      const m = s.match(/^(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)?$/);
+      if (m) {
+        let h = parseInt(m[1], 10);
+        if (/pm/i.test(m[3] || '') && h < 12) h += 12;
+        if (/am/i.test(m[3] || '') && h === 12) h = 0;
+        return `${String(h).padStart(2, '0')}:${m[2]}`;
+      }
+    }
+    return null;
+  }
+
+  function matchImportEmployee(nameOrEmail) {
+    const s = String(nameOrEmail || '').trim().toLowerCase();
+    if (!s) return null;
+    return employeesCache.find(e => (e.email || '').toLowerCase() === s)
+      || employeesCache.find(e => (e.name || '').toLowerCase() === s)
+      || null;
+  }
+
+  // Returns the matching ATTENDANCE_STATUSES value, '' for a blank cell, or
+  // undefined if the text doesn't match any known status.
+  function matchImportStatus(text) {
+    const s = String(text || '').trim().toLowerCase();
+    if (!s) return '';
+    const found = ATTENDANCE_STATUSES.find(st => st.value && (st.value.toLowerCase() === s || st.label.toLowerCase() === s));
+    return found ? found.value : undefined;
+  }
+
+  function downloadImportTemplate() {
+    const headers = ['Employee', 'Date', 'Time In', 'Time Out', 'Status'];
+    const sample = [
+      ['Juan Dela Cruz', '2026-09-14', '08:00', '17:00', ''],
+      ['Maria Santos', '2026-09-15', '', '', 'Paid Leave']
+    ];
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...sample]);
+    ws['!cols'] = [{ wch: 22 }, { wch: 12 }, { wch: 10 }, { wch: 10 }, { wch: 18 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Manual Entries');
+    XLSX.writeFile(wb, 'manual_attendance_template.xlsx');
+  }
+
+  function handleImportFileChange(e) {
+    const file = e.target.files[0];
+    const wrap = document.getElementById('import-preview-wrap');
+    importRows = [];
+    wrap.classList.add('hidden');
+    if (!file) return;
+
+    const periodId = document.getElementById('att-period-select').value;
+    const period = periodsCache.find(p => p.id === periodId);
+    if (!period) {
+      alert('Select a payroll period first (top of this page).');
+      e.target.value = '';
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const data = new Uint8Array(evt.target.result);
+        const wb = XLSX.read(data, { type: 'array', cellDates: true });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+        if (!rows.length) { alert('That file has no data rows.'); return; }
+
+        const empKey = findImportColumn(rows[0], ['employee', 'employee name', 'name']);
+        const dateKey = findImportColumn(rows[0], ['date']);
+        const inKey = findImportColumn(rows[0], ['time in', 'timein', 'time_in']);
+        const outKey = findImportColumn(rows[0], ['time out', 'timeout', 'time_out']);
+        const statusKey = findImportColumn(rows[0], ['status', 'attendance status']);
+
+        if (!empKey || !dateKey) {
+          alert('Could not find "Employee" and "Date" columns in that file. Use the downloadable template for the expected headers.');
+          return;
+        }
+
+        importRows = rows.map((row, i) => {
+          const rawName = row[empKey];
+          const rawStatus = statusKey ? row[statusKey] : '';
+          const employee = matchImportEmployee(rawName);
+          const dateStr = normalizeImportDate(row[dateKey]);
+          const timeInStr = inKey ? normalizeImportTime(row[inKey]) : '';
+          const timeOutStr = outKey ? normalizeImportTime(row[outKey]) : '';
+          const status = matchImportStatus(rawStatus);
+
+          let error = null;
+          if (!rawName) error = 'Missing employee';
+          else if (!employee) error = `No employee matches "${rawName}"`;
+          else if (!dateStr) error = 'Missing or unreadable date';
+          else if (timeInStr === null || timeOutStr === null) error = 'Unreadable time in/out';
+          else if (status === undefined) error = `Unrecognized status "${rawStatus}"`;
+
+          let entry = null;
+          if (!error) {
+            entry = buildManualAttendanceEntry(employee, period, dateStr, timeInStr, timeOutStr, status);
+            if (!entry.ok) error = entry.error;
+          }
+
+          return { rowNum: i + 2, rawName, dateStr, timeInStr, timeOutStr, rawStatus, employee, error, entry: error ? null : entry };
+        });
+
+        renderImportPreview();
+      } catch (err) {
+        alert('Could not read that file: ' + err.message);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  function renderImportPreview() {
+    const wrap = document.getElementById('import-preview-wrap');
+    const tbody = document.getElementById('import-preview-tbody');
+    const summary = document.getElementById('import-preview-summary');
+    const commitBtn = document.getElementById('import-att-commit-btn');
+    wrap.classList.remove('hidden');
+
+    const validCount = importRows.filter(r => !r.error).length;
+    tbody.innerHTML = importRows.map(r => `
+      <tr>
+        <td>${r.rowNum}</td>
+        <td style="white-space:nowrap;">${r.employee ? r.employee.name : (r.rawName || '—')}</td>
+        <td style="white-space:nowrap;">${r.dateStr || '—'}</td>
+        <td style="white-space:nowrap;">${r.timeInStr || '—'}</td>
+        <td style="white-space:nowrap;">${r.timeOutStr || '—'}</td>
+        <td style="white-space:nowrap;">${r.rawStatus || '—'}</td>
+        <td style="white-space:nowrap;">${r.error ? `<span style="color:var(--red);">${r.error}</span>` : '<span style="color:var(--green);">Ready</span>'}</td>
+      </tr>`).join('');
+
+    summary.textContent = `${validCount} of ${importRows.length} row${importRows.length === 1 ? '' : 's'} ready to import.` +
+      (validCount < importRows.length ? ' Rows with errors will be skipped.' : '');
+    commitBtn.disabled = validCount === 0;
+  }
+
+  async function commitImportRows() {
+    const periodId = document.getElementById('att-period-select').value;
+    const period = periodsCache.find(p => p.id === periodId);
+    if (!period) { alert('Select a payroll period first.'); return; }
+    const validRows = importRows.filter(r => !r.error && r.entry);
+    if (!validRows.length) return;
+
+    const btn = document.getElementById('import-att-commit-btn');
+    btn.disabled = true;
+    const originalText = btn.textContent;
+    try {
+      let done = 0;
+      for (const r of validRows) {
+        btn.textContent = `Importing ${++done}/${validRows.length}…`;
+        await setDoc(doc(db, 'attendance', r.entry.docId), r.entry.docData);
+      }
+      alert(`Imported ${validRows.length} attendance ${validRows.length === 1 ? 'entry' : 'entries'}. Open this period in Payroll Processing to see it reflected.`);
+      importRows = [];
+      document.getElementById('import-att-file').value = '';
+      document.getElementById('import-preview-wrap').classList.add('hidden');
+      await loadManualEntries();
+    } catch (err) {
+      alert('Import failed partway through: ' + err.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = originalText || 'Import entries';
     }
   }
 
@@ -2729,6 +2986,22 @@
 
   .btn-add:hover { background: var(--navy-soft); }
 
+  .btn-add:disabled { background: var(--muted); cursor: not-allowed; }
+
+  .mode-toggle { display: flex; gap: 0; margin-bottom: 18px; border: 1px solid var(--line); width: fit-content; }
+  .mode-toggle-btn {
+    padding: 8px 16px;
+    background: var(--paper);
+    border: none;
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    color: var(--muted);
+    border-right: 1px solid var(--line);
+  }
+  .mode-toggle-btn:last-child { border-right: none; }
+  .mode-toggle-btn.active { background: var(--navy); color: #fff; }
+
   .coming-soon {
     text-align: center;
     padding: 60px 20px;
@@ -3063,6 +3336,13 @@
       <div class="panel" id="manual-attendance-panel">
         <h3 id="manual-att-form-title">Manual time entry</h3>
         <div class="panel-sub">For staff not enrolled in PulseTime (or to hand-correct a specific day). Uses the payroll period selected on the left — pick that first. Saving a manual entry for a date that was already pulled from PulseTime replaces that day's record.</div>
+
+        <div class="mode-toggle">
+          <button type="button" class="mode-toggle-btn active" id="manual-att-mode-single">Single entry</button>
+          <button type="button" class="mode-toggle-btn" id="manual-att-mode-import">Import from Excel</button>
+        </div>
+
+        <div id="manual-att-single-wrap">
         <form id="manual-att-form" class="form-grid" style="grid-template-columns: 1fr 1fr; align-items: end; gap:12px;">
           <div class="field">
             <label for="manual-att-employee">Employee</label>
@@ -3090,6 +3370,34 @@
           </div>
         </form>
         <div class="panel-sub" style="margin-top:6px;">Leave a whole day out of time in/out and pick a status (e.g. Paid Leave) instead — hours are left at 0 for those days.</div>
+        </div>
+
+        <div id="manual-att-import-panel" class="hidden">
+          <div class="panel-sub">Upload an .xlsx/.xls/.csv file of entries for the payroll period selected above — each row becomes one manual attendance entry, matched to employees by name (or email) and validated the same way a single entry is, before anything is saved.</div>
+          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:14px;">
+            <button type="button" class="btn-icon" id="download-import-template-btn" style="color:var(--navy);">Download template (.xlsx)</button>
+          </div>
+          <div class="field">
+            <label for="import-att-file">Excel/CSV file</label>
+            <input type="file" id="import-att-file" accept=".xlsx,.xls,.csv" style="width:100%; padding:8px 0; font-family:inherit; font-size:13.5px;">
+          </div>
+          <div class="panel-sub" style="margin-top:6px;">Expected columns: <strong>Employee</strong>, <strong>Date</strong>, <strong>Time In</strong>, <strong>Time Out</strong>, <strong>Status</strong>. Leave Time In/Out blank and set Status (e.g. "Paid Leave") for leave days — same rule as a single entry.</div>
+
+          <div id="import-preview-wrap" class="hidden" style="margin-top:18px;">
+            <div id="import-preview-summary" class="panel-sub" style="margin-bottom:10px;"></div>
+            <div style="overflow-x:auto; max-height:360px; overflow-y:auto; border:1px solid var(--line);">
+              <table style="min-width:720px;">
+                <thead><tr>
+                  <th>Row</th><th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th><th>Status</th><th>Result</th>
+                </tr></thead>
+                <tbody id="import-preview-tbody"></tbody>
+              </table>
+            </div>
+            <div style="margin-top:14px;">
+              <button type="button" class="btn-add" id="import-att-commit-btn" disabled>Import entries</button>
+            </div>
+          </div>
+        </div>
 
         <div style="overflow-x:auto; margin-top:18px;">
         <table>
