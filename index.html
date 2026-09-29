@@ -82,6 +82,7 @@
       loadHolidays();
       loadCashAdvances();
       renderSettingsForm();
+      renderTaxTable();
     }
   });
 
@@ -165,6 +166,74 @@
 
   function pct(fraction) { return Math.round((fraction || 0) * 10000) / 100; } // 0.05 -> 5
   function frac(percent) { return (parseFloat(percent) || 0) / 100; } // 5 -> 0.05
+
+  // ---------- Tax Computation (reference table + manual calculator) ----------
+  // Renders straight from STATUTORY_2026.taxMonthly (the SAME object the real
+  // payroll engine reads), so this never drifts out of sync with what
+  // Processing actually computes — including any admin edits made in Settings.
+  function bracketRangeLabel(brackets, i, multiplier) {
+    const floor = brackets[i].floor * multiplier;
+    const nextFloor = brackets[i + 1] ? brackets[i + 1].floor * multiplier : null;
+    const f = (n) => n.toLocaleString('en-PH', { minimumFractionDigits: 2 });
+    return nextFloor ? `₱${f(floor)} – ₱${f(nextFloor - 0.01)}` : `Over ₱${f(floor)}`;
+  }
+
+  function renderTaxTable() {
+    const monthlyBody = document.getElementById('taxtable-monthly-tbody');
+    const annualBody = document.getElementById('taxtable-annual-tbody');
+    if (!monthlyBody || !annualBody) return;
+    const brackets = STATUTORY_2026.taxMonthly;
+    const f = (n) => '₱' + (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+
+    monthlyBody.innerHTML = brackets.map((b, i) => `
+      <tr>
+        <td>${bracketRangeLabel(brackets, i, 1)}</td>
+        <td class="num">${f(b.base)}</td>
+        <td class="num">${(b.rate * 100).toFixed(0)}%</td>
+      </tr>`).join('');
+
+    annualBody.innerHTML = brackets.map((b, i) => `
+      <tr>
+        <td>${bracketRangeLabel(brackets, i, 12)}</td>
+        <td class="num">${f(b.base * 12)}</td>
+        <td class="num">${(b.rate * 100).toFixed(0)}%</td>
+      </tr>`).join('');
+  }
+
+  function runTaxCalculator() {
+    const rateType = document.getElementById('taxcalc-rate-type').value;
+    const inputVal = parseFloat(document.getElementById('taxcalc-comp').value) || 0;
+    const label = document.getElementById('taxcalc-comp-label');
+    label.textContent = rateType === 'daily' ? 'Daily rate (₱)' : 'Monthly compensation (₱)';
+
+    const C = window.__mpCalc;
+    // Same conversion the real engine uses: a Daily-rate employee's statutory
+    // base is Daily Rate × 26, not the daily rate itself.
+    const monthlyComp = rateType === 'daily' ? C.monthlyEquivalent({ rate_type: 'daily', rate_amount: inputVal }) : inputVal;
+
+    const sss = C.sssEmployeeShare(monthlyComp);
+    const philhealth = C.philhealthEmployeeShare(monthlyComp);
+    const pagibig = C.pagibigEmployeeShare(monthlyComp);
+    const taxableIncome = Math.max(monthlyComp - (sss + philhealth + pagibig), 0);
+    const tax = C.withholdingTax(taxableIncome);
+
+    const f = (n) => (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+    document.getElementById('taxcalc-out-comp').textContent = '₱' + f(monthlyComp);
+    document.getElementById('taxcalc-out-sss').textContent = '−₱' + f(sss);
+    document.getElementById('taxcalc-out-philhealth').textContent = '−₱' + f(philhealth);
+    document.getElementById('taxcalc-out-pagibig').textContent = '−₱' + f(pagibig);
+    document.getElementById('taxcalc-out-taxable').textContent = '₱' + f(taxableIncome);
+    document.getElementById('taxcalc-out-tax').textContent = '₱' + f(tax);
+
+    const brackets = STATUTORY_2026.taxMonthly;
+    let bracketIdx = 0;
+    brackets.forEach((b, i) => { if (taxableIncome >= b.floor) bracketIdx = i; });
+    const note = rateType === 'daily'
+      ? `Statutory base = ₱${f(inputVal)}/day × 26 = ₱${f(monthlyComp)}/mo. `
+      : '';
+    document.getElementById('taxcalc-bracket-note').textContent =
+      note + `Falls in bracket: ${bracketRangeLabel(brackets, bracketIdx, 1)} (₱${f(brackets[bracketIdx].base)} + ${(brackets[bracketIdx].rate * 100).toFixed(0)}% of excess over ₱${f(brackets[bracketIdx].floor)}).`;
+  }
 
   function renderSettingsForm() {
     const form = document.getElementById('settings-form');
@@ -391,6 +460,9 @@
 
     document.getElementById('ca-form').addEventListener('submit', createCashAdvance);
 
+    document.getElementById('taxcalc-comp').addEventListener('input', runTaxCalculator);
+    document.getElementById('taxcalc-rate-type').addEventListener('change', runTaxCalculator);
+
     document.getElementById('settings-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       if (currentUserRole !== 'admin') return;
@@ -400,6 +472,7 @@
       try {
         await saveStatutorySettings(collectSettingsPayload());
         renderSettingsForm();
+        renderTaxTable();
         alert('Settings saved. New computations will use these values immediately.');
       } catch (err) {
         alert('Could not save settings: ' + err.message);
@@ -2816,6 +2889,7 @@
     <button class="nav-item" data-target="view-approval">Approval</button>
     <button class="nav-item" data-target="view-payslip">Payslips</button>
     <button class="nav-item" data-target="view-reports">Reports</button>
+    <button class="nav-item" data-target="view-taxcomputation">Tax Computation</button>
     <button class="nav-item" id="nav-settings-btn" data-target="view-settings">Settings</button>
   </nav>
 
@@ -3233,6 +3307,59 @@
       <div class="panel hidden" id="report-wrap">
         <div class="stat-grid" id="report-stats" style="margin-bottom:24px;"></div>
         <div id="report-register-content"></div>
+      </div>
+    </section>
+
+    <section id="view-taxcomputation" class="view hidden">
+      <div class="panel">
+        <h3>Philippine Withholding Tax Table</h3>
+        <div class="panel-sub">BIR TRAIN Law brackets, currently in effect (source: whatever's set in Settings — this always reflects the live rates the payroll engine actually uses, not a separate copy).</div>
+        <div style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>Monthly taxable income</th><th class="num">Base tax (monthly)</th><th class="num">Rate on excess</th></tr></thead>
+          <tbody id="taxtable-monthly-tbody"></tbody>
+        </table>
+        </div>
+        <h3 style="font-size:14px; margin-top:24px; margin-bottom:2px;">Annual equivalent</h3>
+        <div class="panel-sub" style="margin-bottom:12px;">Same brackets × 12 — the format most commonly published by BIR, for reference.</div>
+        <div style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>Annual taxable income</th><th class="num">Base tax (annual)</th><th class="num">Rate on excess</th></tr></thead>
+          <tbody id="taxtable-annual-tbody"></tbody>
+        </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Tax calculator</h3>
+        <div class="panel-sub">Manual check — uses the exact same formulas as Payroll Processing (SSS/PhilHealth/Pag-IBIG employee shares deducted first, then tax on what's left). Enter a monthly compensation figure to see the full breakdown.</div>
+        <div class="form-grid" style="grid-template-columns: 1fr 1fr;">
+          <div class="field">
+            <label for="taxcalc-rate-type">Employee type</label>
+            <select id="taxcalc-rate-type" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;">
+              <option value="monthly">Monthly-rate</option>
+              <option value="daily">Daily-rate</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="taxcalc-comp" id="taxcalc-comp-label">Monthly compensation (₱)</label>
+            <input type="number" id="taxcalc-comp" step="0.01" min="0" placeholder="e.g. 30000">
+          </div>
+        </div>
+
+        <table class="sheet-table" style="max-width:480px; margin-top:18px;">
+          <tbody>
+            <tr><td>Monthly compensation</td><td class="num" id="taxcalc-out-comp">₱0.00</td></tr>
+            <tr><td>Less: SSS (employee share)</td><td class="num" id="taxcalc-out-sss">−₱0.00</td></tr>
+            <tr><td>Less: PhilHealth (employee share)</td><td class="num" id="taxcalc-out-philhealth">−₱0.00</td></tr>
+            <tr><td>Less: Pag-IBIG (employee share)</td><td class="num" id="taxcalc-out-pagibig">−₱0.00</td></tr>
+          </tbody>
+          <tfoot>
+            <tr><td>Taxable income</td><td class="num" id="taxcalc-out-taxable" style="font-weight:600;">₱0.00</td></tr>
+            <tr><td>Withholding tax (monthly)</td><td class="num" id="taxcalc-out-tax" style="font-weight:600; color:var(--navy);">₱0.00</td></tr>
+          </tfoot>
+        </table>
+        <div id="taxcalc-bracket-note" style="margin-top:10px; font-size:12px; color:var(--muted);"></div>
       </div>
     </section>
 
