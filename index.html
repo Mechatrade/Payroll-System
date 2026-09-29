@@ -1842,6 +1842,7 @@
           <td>${actions}</td>
         </tr>`;
     }).join('') || `<tr><td colspan="9" class="empty">No cash advances yet.</td></tr>`;
+    updateDashboardStats();
   }
 
   async function createCashAdvance(e) {
@@ -2133,7 +2134,86 @@
       renderApprovalList();
       populatePayslipPeriodSelect();
       populateReportPeriodSelect();
+      updateDashboardStats();
     });
+  }
+
+  // Dashboard: current cutoff = whichever payroll period's date range covers
+  // today (Asia/Manila), falling back to the most recent one if none does.
+  // Also surfaces counts that need someone's attention: periods awaiting
+  // approval, and cash advances still being paid off.
+  function updateDashboardStats() {
+    const periodEl = document.getElementById('stat-period');
+    if (periodEl) {
+      const todayManila = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' }); // YYYY-MM-DD
+      const active = periodsCache.find(p => p.cutoff_start <= todayManila && todayManila <= p.cutoff_end);
+      if (active) {
+        periodEl.textContent = `${active.cutoff_start} – ${active.cutoff_end}`;
+      } else if (periodsCache.length) {
+        periodEl.textContent = `No active cutoff (latest: ${periodsCache[0].cutoff_start} – ${periodsCache[0].cutoff_end})`;
+        periodEl.style.fontSize = '13px';
+      } else {
+        periodEl.textContent = 'No payroll periods yet';
+        periodEl.style.fontSize = '13px';
+      }
+    }
+    const approvalEl = document.getElementById('stat-pending-approval');
+    if (approvalEl) {
+      approvalEl.textContent = periodsCache.filter(p => p.status === 'for_approval').length;
+    }
+    const caEl = document.getElementById('stat-open-cash-advances');
+    const caBalanceEl = document.getElementById('stat-cash-advance-balance');
+    if (Array.isArray(cashAdvancesCache)) {
+      const openAdvances = cashAdvancesCache.filter(c => (c.terms_paid || 0) < (c.terms || 0));
+      if (caEl) caEl.textContent = openAdvances.length;
+      if (caBalanceEl) {
+        const outstanding = openAdvances.reduce((sum, c) => sum + (c.balance_remaining || 0), 0);
+        caBalanceEl.textContent = '₱' + outstanding.toLocaleString('en-PH', { minimumFractionDigits: 2 });
+      }
+    }
+    const nextPayEl = document.getElementById('stat-next-paydate');
+    if (nextPayEl) {
+      const todayManila = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' });
+      const upcoming = periodsCache
+        .filter(p => p.pay_date && p.pay_date >= todayManila)
+        .sort((a, b) => a.pay_date.localeCompare(b.pay_date))[0];
+      nextPayEl.style.fontSize = '15px';
+      if (upcoming) {
+        const days = Math.round((new Date(upcoming.pay_date) - new Date(todayManila)) / 86400000);
+        nextPayEl.textContent = days === 0 ? `${upcoming.pay_date} (today)` : `${upcoming.pay_date} (in ${days} day${days === 1 ? '' : 's'})`;
+      } else {
+        nextPayEl.textContent = 'No upcoming pay date';
+        nextPayEl.style.fontSize = '13px';
+      }
+    }
+    updateDashboardFinancials();
+  }
+
+  // Net payroll total and needs-review count for the "reference" period
+  // (whichever one is currently active by date, else the latest one) —
+  // fetched separately since payroll_records isn't a live-cached collection
+  // elsewhere in the app. Token-guarded so a fast second call (e.g. periods
+  // and cash advances both loading at startup) can't let a stale fetch
+  // overwrite a newer one.
+  let dashboardFinancialsToken = 0;
+  async function updateDashboardFinancials() {
+    const netEl = document.getElementById('stat-net-payroll');
+    const reviewEl = document.getElementById('stat-needs-review');
+    if (!netEl && !reviewEl) return;
+    const todayManila = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Manila' });
+    const refPeriod = periodsCache.find(p => p.cutoff_start <= todayManila && todayManila <= p.cutoff_end) || periodsCache[0];
+    if (!refPeriod) {
+      if (netEl) netEl.textContent = '—';
+      if (reviewEl) reviewEl.textContent = '0';
+      return;
+    }
+    const token = ++dashboardFinancialsToken;
+    const records = await fetchRecordsForPeriod(refPeriod.id);
+    if (token !== dashboardFinancialsToken) return;
+    const totalNet = records.reduce((sum, r) => sum + (r.net || 0), 0);
+    const needsReviewCount = records.filter(r => r.needsReview).length;
+    if (netEl) netEl.textContent = '₱' + totalNet.toLocaleString('en-PH', { minimumFractionDigits: 2 });
+    if (reviewEl) reviewEl.textContent = needsReviewCount;
   }
 
   window.__mpOpenPeriod = (periodId) => {
@@ -3470,14 +3550,37 @@
           <div class="stat-label">Current cutoff</div>
           <div class="stat-value" id="stat-period" style="font-size:15px;">—</div>
         </div>
+        <div class="stat-cell">
+          <div class="stat-label">Periods awaiting approval</div>
+          <div class="stat-value" id="stat-pending-approval">0</div>
+        </div>
+        <div class="stat-cell">
+          <div class="stat-label">Employees with open cash advance</div>
+          <div class="stat-value" id="stat-open-cash-advances">0</div>
+        </div>
+        <div class="stat-cell">
+          <div class="stat-label">Net payroll (current cutoff)</div>
+          <div class="stat-value" id="stat-net-payroll" style="font-size:20px;">—</div>
+        </div>
+        <div class="stat-cell">
+          <div class="stat-label">Records needing review</div>
+          <div class="stat-value" id="stat-needs-review">0</div>
+        </div>
+        <div class="stat-cell">
+          <div class="stat-label">Next pay date</div>
+          <div class="stat-value" id="stat-next-paydate" style="font-size:15px;">—</div>
+        </div>
+        <div class="stat-cell">
+          <div class="stat-label">Outstanding cash advance balance</div>
+          <div class="stat-value" id="stat-cash-advance-balance" style="font-size:20px;">—</div>
+        </div>
       </div>
       <div class="panel">
-        <h3>Getting started</h3>
-        <div class="panel-sub">This is the scaffold — Firestore-connected, Firebase Auth-gated.</div>
+        <h3>Quick workflow</h3>
         <p style="color:var(--muted); line-height:1.6; margin:0;">
-          Add employees under <strong>Employees</strong>, tagging each as daily or monthly rate.
-          Attendance, payroll processing, approval, payslips, and reports are stubbed as placeholders,
-          following the same control-number-traced workflow used in Mechatrade CRM.
+          Pull or manually enter <strong>Attendance</strong> for a cutoff → add any one-off <strong>Adjustments</strong> →
+          run <strong>Payroll Processing</strong> and enter each employee's withholding tax → send for <strong>Approval</strong> →
+          release and print <strong>Payslips</strong>.
         </p>
       </div>
     </section>
