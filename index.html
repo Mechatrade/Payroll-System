@@ -1801,8 +1801,18 @@
     snap.forEach(d => cashAdvancesCache.push({ id: d.id, ...d.data() }));
 
     const f = (n) => '₱' + (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+    const isAdmin = currentUserRole === 'admin';
     tbody.innerHTML = cashAdvancesCache.map(ca => {
       const emp = employeesCache.find(e => e.id === ca.employee_id);
+      const canCancel = ca.status === 'active' && !(ca.terms_paid > 0);
+      const actions = [
+        canCancel ? `<button class="btn-icon" style="color:var(--red);" onclick="__mpCancelCashAdvance('${ca.id}')">Cancel</button>` : '',
+        // Delete is a full record removal (Admin-only) — unlike Cancel, it's
+        // available regardless of status/progress, for cleaning up mistaken
+        // entries. It also clears that advance's deduction logs so nothing
+        // dangling is left for a period's "Send back to draft" to trip over.
+        isAdmin ? `<button class="btn-icon" style="color:var(--red);" onclick="__mpDeleteCashAdvance('${ca.id}')">Delete</button>` : ''
+      ].filter(Boolean).join(' · ');
       return `
         <tr>
           <td>${emp ? emp.name : ca.employee_id}</td>
@@ -1813,7 +1823,7 @@
           <td>${ca.terms_paid || 0} / ${ca.terms}</td>
           <td><span class="status status-${ca.status === 'active' ? 'active' : 'inactive'}">${ca.status}</span></td>
           <td>${ca.date_granted || '—'}</td>
-          <td>${ca.status === 'active' && !(ca.terms_paid > 0) ? `<button class="btn-icon" style="color:var(--red);" onclick="__mpCancelCashAdvance('${ca.id}')">Cancel</button>` : ''}</td>
+          <td>${actions}</td>
         </tr>`;
     }).join('') || `<tr><td colspan="9" class="empty">No cash advances yet.</td></tr>`;
   }
@@ -1849,6 +1859,30 @@
   window.__mpCancelCashAdvance = async (id) => {
     if (!confirm('Cancel this cash advance? Only allowed before any installment has been deducted.')) return;
     await updateDoc(doc(db, 'cash_advances', id), { status: 'cancelled' });
+    loadCashAdvances();
+  };
+
+  // Admin-only: permanently removes a cash advance record, regardless of its
+  // status or how many installments it has already deducted — unlike Cancel,
+  // which only works on an untouched active advance. Also clears any
+  // cash_advance_deductions logs tied to it, so a later "Send back to draft"
+  // on a period that deducted against this advance doesn't try to reverse a
+  // deduction whose parent record no longer exists.
+  window.__mpDeleteCashAdvance = async (id) => {
+    if (currentUserRole !== 'admin') return;
+    const ca = cashAdvancesCache.find(c => c.id === id);
+    const emp = ca ? employeesCache.find(e => e.id === ca.employee_id) : null;
+    const warn = ca && ca.terms_paid > 0
+      ? ` This advance already has ${ca.terms_paid} installment(s) deducted — deleting it will NOT refund those amounts on past payslips, it only removes this ledger record.`
+      : '';
+    if (!confirm(`Permanently delete this cash advance record${emp ? ' for ' + emp.name : ''}? This cannot be undone.${warn}`)) return;
+
+    const logsQuery = query(collection(db, 'cash_advance_deductions'), where('cash_advance_id', '==', id));
+    const logsSnap = await getDocs(logsQuery);
+    for (const logDoc of logsSnap.docs) {
+      await deleteDoc(doc(db, 'cash_advance_deductions', logDoc.id));
+    }
+    await deleteDoc(doc(db, 'cash_advances', id));
     loadCashAdvances();
   };
 
