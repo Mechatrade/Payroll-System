@@ -17,7 +17,7 @@
   } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
   import {
     getFirestore, collection, doc, addDoc, updateDoc, deleteDoc,
-    getDocs, getDoc, setDoc, runTransaction, query, orderBy, onSnapshot, serverTimestamp
+    getDocs, getDoc, setDoc, runTransaction, query, where, orderBy, onSnapshot, serverTimestamp
   } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
 
   const firebaseConfig = {
@@ -32,8 +32,37 @@
   const app = initializeApp(firebaseConfig);
   const auth = getAuth(app);
   const db = getFirestore(app);
-  window.__mp = { auth, db, signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut,
-    collection, doc, addDoc, updateDoc, deleteDoc, getDocs, getDoc, setDoc, runTransaction, query, orderBy, onSnapshot, serverTimestamp };
+
+  // ---- Mechatrade PulseTime (timetracker) — read-only connection ----
+  // Payroll never writes here. It reads raw time-in/time-out for a cutoff's
+  // date range, then copies it into payroll's own `attendance` collection
+  // (see the Attendance module) so processed payroll stays reproducible even
+  // if PulseTime records are edited afterward.
+  const timetrackerConfig = {
+    apiKey: "AIzaSyCCjq_qDVIZ3YYnPgPuuPI0NFuLMoz9nCU",
+    authDomain: "mechatrade-pulsetime.firebaseapp.com",
+    projectId: "mechatrade-pulsetime",
+    storageBucket: "mechatrade-pulsetime.firebasestorage.app",
+    messagingSenderId: "510523514828",
+    appId: "1:510523514828:web:139f728fa231406d284769"
+  };
+  const ttApp = initializeApp(timetrackerConfig, "timetracker");
+  const dbTimetracker = getFirestore(ttApp);
+  const ttAuth = getAuth(ttApp);
+
+  // Dedicated, low-privilege PulseTime account (role: staff, status: approved)
+  // used only so payroll's read requests satisfy PulseTime's isApproved() rule.
+  // It has no elevated access beyond any regular approved PulseTime teammate.
+  const PULSETIME_READER_EMAIL = "payroll-sync@mechatrade.com";
+  const PULSETIME_READER_PASSWORD = "123456789";
+
+  async function ensureTimetrackerAuth() {
+    if (ttAuth.currentUser) return;
+    await signInWithEmailAndPassword(ttAuth, PULSETIME_READER_EMAIL, PULSETIME_READER_PASSWORD);
+  }
+
+  window.__mp = { auth, db, dbTimetracker, signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut,
+    collection, doc, addDoc, updateDoc, deleteDoc, getDocs, getDoc, setDoc, runTransaction, query, where, orderBy, onSnapshot, serverTimestamp };
 
   // ---------- App bootstrap ----------
   let currentUserRole = null;
@@ -44,10 +73,16 @@
     if (user) {
       currentUserRole = await ensureUserRole(user);
       document.getElementById('user-email').textContent = `${user.email} · ${currentUserRole === 'admin' ? 'Admin' : 'Staff'}`;
+      document.getElementById('nav-settings-btn').classList.toggle('hidden', currentUserRole !== 'admin');
+      await loadStatutorySettings();
       loadEmployees();
       loadDashboard();
       loadPeriods();
       loadEmployeesForProcessing();
+      loadHolidays();
+      loadCashAdvances();
+      renderSettingsForm();
+      renderTaxTable();
     }
   });
 
@@ -70,6 +105,260 @@
     return assignedRole;
   }
 
+  // ---------- Statutory & pay-premium settings (Firestore-backed, Settings tab) ----------
+  // First login ever seeds Firestore with the code defaults (STATUTORY_2026 / day-type
+  // multipliers / NSD_RATE above) so there's always something to view/edit immediately.
+  // Every login after that overwrites the in-memory defaults with whatever's saved,
+  // so an admin's edit takes effect for every user on their next login without a redeploy.
+  let statutorySettingsLoaded = false;
+  async function loadStatutorySettings() {
+    try {
+      const ref = doc(db, 'settings', 'statutory');
+      const snap = await getDoc(ref);
+      if (snap.exists()) {
+        const data = snap.data();
+        if (data.sss) STATUTORY_2026.sss = data.sss;
+        if (data.philhealth) STATUTORY_2026.philhealth = data.philhealth;
+        if (data.pagibig) STATUTORY_2026.pagibig = data.pagibig;
+        if (data.taxMonthly) {
+          // Earlier builds seeded 2018–2022 bracket bases. Correct only that
+          // recognizable schedule; leave deliberately customized tables alone.
+          const oldFloors = [0, 20833, 33333, 66667, 166667, 666667];
+          const oldBases = [0, 0, 2500, 10833.33, 40833.33, 200833.33];
+          const oldRates = [0, .15, .20, .25, .30, .35];
+          const legacy = data.taxMonthly.length === 6 && data.taxMonthly.every((b, i) =>
+            b.floor === oldFloors[i] && (b.base === oldBases[i] || (i === 0 && b.base === 250000)) && b.rate === oldRates[i]);
+          STATUTORY_2026.taxMonthly = legacy ? BIR_MONTHLY_2023.map(b => ({ ...b })) : data.taxMonthly;
+          // Persist once, so other signed-in users also receive the corrected table.
+          if (legacy && currentUserRole === 'admin') {
+            await updateDoc(ref, { taxMonthly: STATUTORY_2026.taxMonthly, tax_table_corrected_at: serverTimestamp() });
+          }
+        }
+        if (data.dayTypeWorked) window.__mpCalc.DAY_TYPE_WORKED_MULTIPLIER = data.dayTypeWorked;
+        if (data.dayTypeOT) window.__mpCalc.DAY_TYPE_OT_MULTIPLIER = data.dayTypeOT;
+        if (typeof data.nsdRate === 'number') NSD_RATE = data.nsdRate;
+        if (typeof data.doleDailyRateFactor === 'number') DOLE_DAILY_RATE_FACTOR = data.doleDailyRateFactor;
+      } else {
+        await setDoc(ref, {
+          sss: STATUTORY_2026.sss, philhealth: STATUTORY_2026.philhealth, pagibig: STATUTORY_2026.pagibig,
+          taxMonthly: STATUTORY_2026.taxMonthly,
+          dayTypeWorked: window.__mpCalc.DAY_TYPE_WORKED_MULTIPLIER, dayTypeOT: window.__mpCalc.DAY_TYPE_OT_MULTIPLIER,
+          nsdRate: NSD_RATE, doleDailyRateFactor: DOLE_DAILY_RATE_FACTOR, seeded_at: serverTimestamp()
+        });
+      }
+      statutorySettingsLoaded = true;
+    } catch (err) {
+      console.error('Could not load statutory settings, using code defaults:', err);
+    }
+  }
+
+  async function saveStatutorySettings(payload) {
+    await setDoc(doc(db, 'settings', 'statutory'), { ...payload, updated_at: serverTimestamp() });
+    // Apply immediately in-memory so calculations reflect the change without a reload.
+    STATUTORY_2026.sss = payload.sss;
+    STATUTORY_2026.philhealth = payload.philhealth;
+    STATUTORY_2026.pagibig = payload.pagibig;
+    STATUTORY_2026.taxMonthly = payload.taxMonthly;
+    window.__mpCalc.DAY_TYPE_WORKED_MULTIPLIER = payload.dayTypeWorked;
+    window.__mpCalc.DAY_TYPE_OT_MULTIPLIER = payload.dayTypeOT;
+    NSD_RATE = payload.nsdRate;
+    DOLE_DAILY_RATE_FACTOR = payload.doleDailyRateFactor;
+  }
+
+  const DAY_TYPE_LABELS = {
+    regular: 'Regular Workday',
+    rest_day: 'Rest Day',
+    special_non_working: 'Special (Non-working) Day',
+    special_rest_day: 'Special Day + Rest Day',
+    regular_holiday: 'Regular Holiday',
+    regular_holiday_rest_day: 'Regular Holiday + Rest Day',
+    double_holiday: 'Double Holiday',
+    double_holiday_rest_day: 'Double Holiday + Rest Day'
+  };
+  const DAY_TYPE_ORDER = Object.keys(DAY_TYPE_LABELS);
+
+  function pct(fraction) { return Math.round((fraction || 0) * 10000) / 100; } // 0.05 -> 5
+  function frac(percent) { return (parseFloat(percent) || 0) / 100; } // 5 -> 0.05
+
+  // ---------- Tax Computation (reference table + manual calculator) ----------
+  // Renders straight from STATUTORY_2026.taxMonthly (the SAME object the real
+  // payroll engine reads), so this never drifts out of sync with what
+  // Processing actually computes — including any admin edits made in Settings.
+  function bracketRangeLabel(brackets, i, multiplier) {
+    const floor = brackets[i].floor * multiplier;
+    const nextFloor = brackets[i + 1] ? brackets[i + 1].floor * multiplier : null;
+    const f = (n) => n.toLocaleString('en-PH', { minimumFractionDigits: 2 });
+    return nextFloor ? `₱${f(floor)} – ₱${f(nextFloor - 0.01)}` : `Over ₱${f(floor)}`;
+  }
+
+  function renderTaxTable() {
+    const monthlyBody = document.getElementById('taxtable-monthly-tbody');
+    const annualBody = document.getElementById('taxtable-annual-tbody');
+    if (!monthlyBody || !annualBody) return;
+    const brackets = STATUTORY_2026.taxMonthly;
+    const f = (n) => '₱' + (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+
+    monthlyBody.innerHTML = brackets.map((b, i) => `
+      <tr>
+        <td>${bracketRangeLabel(brackets, i, 1)}</td>
+        <td class="num">${f(b.base)}</td>
+        <td class="num">${(b.rate * 100).toFixed(0)}%</td>
+      </tr>`).join('');
+
+    annualBody.innerHTML = brackets.map((b, i) => `
+      <tr>
+        <td>${bracketRangeLabel(brackets, i, 12)}</td>
+        <td class="num">${f(b.base * 12)}</td>
+        <td class="num">${(b.rate * 100).toFixed(0)}%</td>
+      </tr>`).join('');
+  }
+
+  function runTaxCalculator() {
+    const rateType = document.getElementById('taxcalc-rate-type').value;
+    const inputVal = parseFloat(document.getElementById('taxcalc-comp').value) || 0;
+    const label = document.getElementById('taxcalc-comp-label');
+    label.textContent = rateType === 'daily' ? 'Daily rate (₱)' : 'Monthly compensation (₱)';
+
+    const C = window.__mpCalc;
+    // Same conversion the real engine uses: a Daily-rate employee's statutory
+    // base is Daily Rate × 26, not the daily rate itself.
+    const monthlyComp = rateType === 'daily' ? C.monthlyEquivalent({ rate_type: 'daily', rate_amount: inputVal }) : inputVal;
+
+    const sss = C.sssEmployeeShare(monthlyComp);
+    const philhealth = C.philhealthEmployeeShare(monthlyComp);
+    const pagibig = C.pagibigEmployeeShare(monthlyComp);
+    const taxableIncome = Math.max(monthlyComp - (sss + philhealth + pagibig), 0);
+    const tax = C.withholdingTax(taxableIncome);
+
+    const f = (n) => (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+    document.getElementById('taxcalc-out-comp').textContent = '₱' + f(monthlyComp);
+    document.getElementById('taxcalc-out-sss').textContent = '−₱' + f(sss);
+    document.getElementById('taxcalc-out-philhealth').textContent = '−₱' + f(philhealth);
+    document.getElementById('taxcalc-out-pagibig').textContent = '−₱' + f(pagibig);
+    document.getElementById('taxcalc-out-taxable').textContent = '₱' + f(taxableIncome);
+    document.getElementById('taxcalc-out-tax').textContent = '₱' + f(tax);
+
+    const brackets = STATUTORY_2026.taxMonthly;
+    let bracketIdx = 0;
+    brackets.forEach((b, i) => { if (taxableIncome >= b.floor) bracketIdx = i; });
+    const note = rateType === 'daily'
+      ? `Statutory base = ₱${f(inputVal)}/day × 26 = ₱${f(monthlyComp)}/mo. `
+      : '';
+    document.getElementById('taxcalc-bracket-note').textContent =
+      note + `Falls in bracket: ${bracketRangeLabel(brackets, bracketIdx, 1)} (₱${f(brackets[bracketIdx].base)} + ${(brackets[bracketIdx].rate * 100).toFixed(0)}% of excess over ₱${f(brackets[bracketIdx].floor)}).`;
+  }
+
+  function renderSettingsForm() {
+    const form = document.getElementById('settings-form');
+    if (!form) return;
+    const isAdmin = currentUserRole === 'admin';
+
+    document.getElementById('set-sss-rateTotal').value = pct(STATUTORY_2026.sss.rateTotal);
+    document.getElementById('set-sss-employeeShare').value = pct(STATUTORY_2026.sss.employeeShare);
+    document.getElementById('set-sss-mscFloor').value = STATUTORY_2026.sss.mscFloor;
+    document.getElementById('set-sss-mscCeiling').value = STATUTORY_2026.sss.mscCeiling;
+    document.getElementById('set-sss-mscStep').value = STATUTORY_2026.sss.mscStep;
+    document.getElementById('set-sss-ecThreshold').value = STATUTORY_2026.sss.ecThreshold;
+    document.getElementById('set-sss-ecBelow').value = STATUTORY_2026.sss.ecBelow;
+    document.getElementById('set-sss-ecAtOrAbove').value = STATUTORY_2026.sss.ecAtOrAbove;
+
+    document.getElementById('set-ph-rateTotal').value = pct(STATUTORY_2026.philhealth.rateTotal);
+    document.getElementById('set-ph-employeeShare').value = pct(STATUTORY_2026.philhealth.employeeShare);
+    document.getElementById('set-ph-floor').value = STATUTORY_2026.philhealth.floor;
+    document.getElementById('set-ph-ceiling').value = STATUTORY_2026.philhealth.ceiling;
+
+    document.getElementById('set-pi-rateLow').value = pct(STATUTORY_2026.pagibig.rateLow);
+    document.getElementById('set-pi-rateStandard').value = pct(STATUTORY_2026.pagibig.rateStandard);
+    document.getElementById('set-pi-lowThreshold').value = STATUTORY_2026.pagibig.lowThreshold;
+    document.getElementById('set-pi-mfsCap').value = STATUTORY_2026.pagibig.mfsCap;
+
+    document.getElementById('set-nsd-rate').value = pct(NSD_RATE);
+    document.getElementById('set-dole-factor').value = DOLE_DAILY_RATE_FACTOR;
+
+    renderTaxBracketRows(STATUTORY_2026.taxMonthly);
+    renderDayTypeRows(window.__mpCalc.DAY_TYPE_WORKED_MULTIPLIER, window.__mpCalc.DAY_TYPE_OT_MULTIPLIER);
+
+    // Read-only for non-admins: disable every input/button, show the notice.
+    document.getElementById('settings-readonly-notice').classList.toggle('hidden', isAdmin);
+    form.querySelectorAll('input, button').forEach(el => { el.disabled = !isAdmin; });
+
+    if (statutorySettingsLoaded && isAdmin) {
+      getDoc(doc(db, 'settings', 'statutory')).then(snap => {
+        if (snap.exists() && snap.data().updated_at) {
+          const d = snap.data().updated_at.toDate ? snap.data().updated_at.toDate() : null;
+          document.getElementById('settings-updated-note').textContent = d ? `Last updated ${d.toLocaleString('en-PH', { timeZone: 'Asia/Manila' })}` : '';
+        }
+      }).catch(() => {});
+    }
+  }
+
+  function renderTaxBracketRows(brackets) {
+    const tbody = document.getElementById('settings-tax-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = brackets.map((b, i) => `
+      <tr data-row="${i}">
+        <td><input type="number" class="tax-floor" value="${b.floor}" step="1" min="0" style="width:100px;"></td>
+        <td><input type="number" class="tax-base" value="${b.base}" step="0.01" min="0" style="width:100px;"></td>
+        <td><input type="number" class="tax-rate" value="${pct(b.rate)}" step="0.01" min="0" style="width:80px;"></td>
+        <td><button type="button" class="btn-icon" style="color:var(--red);" onclick="this.closest('tr').remove()">Remove</button></td>
+      </tr>`).join('');
+  }
+
+  function renderDayTypeRows(worked, ot) {
+    const tbody = document.getElementById('settings-daytype-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = DAY_TYPE_ORDER.map(key => `
+      <tr data-daytype="${key}">
+        <td>${DAY_TYPE_LABELS[key]}</td>
+        <td><input type="number" class="daytype-worked" value="${worked[key] ?? 1}" step="0.01" min="0" style="width:90px;"></td>
+        <td><input type="number" class="daytype-ot" value="${ot[key] ?? 1.25}" step="0.01" min="0" style="width:90px;"></td>
+      </tr>`).join('');
+  }
+
+  function collectSettingsPayload() {
+    const taxMonthly = Array.from(document.querySelectorAll('#settings-tax-tbody tr')).map(tr => ({
+      floor: parseFloat(tr.querySelector('.tax-floor').value) || 0,
+      base: parseFloat(tr.querySelector('.tax-base').value) || 0,
+      rate: frac(tr.querySelector('.tax-rate').value)
+    })).sort((a, b) => a.floor - b.floor);
+
+    const dayTypeWorked = {}, dayTypeOT = {};
+    document.querySelectorAll('#settings-daytype-tbody tr').forEach(tr => {
+      const key = tr.dataset.daytype;
+      dayTypeWorked[key] = parseFloat(tr.querySelector('.daytype-worked').value) || 1;
+      dayTypeOT[key] = parseFloat(tr.querySelector('.daytype-ot').value) || 1.25;
+    });
+
+    return {
+      sss: {
+        rateTotal: frac(document.getElementById('set-sss-rateTotal').value),
+        employeeShare: frac(document.getElementById('set-sss-employeeShare').value),
+        mscFloor: parseFloat(document.getElementById('set-sss-mscFloor').value) || 0,
+        mscCeiling: parseFloat(document.getElementById('set-sss-mscCeiling').value) || 0,
+        mscStep: parseFloat(document.getElementById('set-sss-mscStep').value) || 500,
+        ecThreshold: parseFloat(document.getElementById('set-sss-ecThreshold').value) || 0,
+        ecBelow: parseFloat(document.getElementById('set-sss-ecBelow').value) || 0,
+        ecAtOrAbove: parseFloat(document.getElementById('set-sss-ecAtOrAbove').value) || 0
+      },
+      philhealth: {
+        rateTotal: frac(document.getElementById('set-ph-rateTotal').value),
+        employeeShare: frac(document.getElementById('set-ph-employeeShare').value),
+        floor: parseFloat(document.getElementById('set-ph-floor').value) || 0,
+        ceiling: parseFloat(document.getElementById('set-ph-ceiling').value) || 0
+      },
+      pagibig: {
+        rateLow: frac(document.getElementById('set-pi-rateLow').value),
+        rateStandard: frac(document.getElementById('set-pi-rateStandard').value),
+        lowThreshold: parseFloat(document.getElementById('set-pi-lowThreshold').value) || 0,
+        mfsCap: parseFloat(document.getElementById('set-pi-mfsCap').value) || 0
+      },
+      taxMonthly,
+      dayTypeWorked, dayTypeOT,
+      nsdRate: frac(document.getElementById('set-nsd-rate').value),
+      doleDailyRateFactor: parseFloat(document.getElementById('set-dole-factor').value) || 261
+    };
+  }
+
 
   document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('login-form').addEventListener('submit', async (e) => {
@@ -86,6 +375,17 @@
     });
 
     document.getElementById('logout-btn').addEventListener('click', () => signOut(auth));
+
+    document.querySelectorAll('.toggle-password').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const input = document.getElementById(btn.dataset.target);
+        const showing = input.type === 'text';
+        input.type = showing ? 'password' : 'text';
+        btn.querySelector('.icon-eye').classList.toggle('hidden', !showing);
+        btn.querySelector('.icon-eye-off').classList.toggle('hidden', showing);
+        btn.setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
+      });
+    });
 
     document.getElementById('toggle-signup').addEventListener('click', () => {
       document.getElementById('login-form').classList.add('hidden');
@@ -131,11 +431,68 @@
     });
 
     document.getElementById('employee-form').addEventListener('submit', addEmployee);
+    document.getElementById('employee-cancel-btn').addEventListener('click', () => {
+      exitEditMode();
+      document.getElementById('employee-form').reset();
+      document.getElementById('rate-label').textContent = 'Daily rate (₱)';
+    });
     document.getElementById('period-form').addEventListener('submit', createPeriod);
     document.getElementById('save-batch-btn').addEventListener('click', saveBatch);
-    document.getElementById('period-type-active').addEventListener('change', (e) => {
-      e.target.dataset.type = e.target.value;
-      if (currentPeriodId) renderProcessingTable();
+    document.getElementById('pull-pulsetime-btn').addEventListener('click', pullFromPulseTime);
+    document.getElementById('save-attendance-btn').addEventListener('click', saveAttendanceSnapshot);
+    document.getElementById('manual-att-form').addEventListener('submit', saveManualAttendance);
+    document.getElementById('manual-att-cancel-btn').addEventListener('click', exitManualAttEditMode);
+    document.getElementById('manual-att-status').addEventListener('change', updateManualAttTimeRequirement);
+    document.getElementById('att-period-select').addEventListener('change', () => loadManualEntries());
+    document.getElementById('holiday-form').addEventListener('submit', addHoliday);
+    document.getElementById('manual-att-status').innerHTML = ATTENDANCE_STATUSES.map(s =>
+      `<option value="${s.value}">${s.label}</option>`).join('');
+    updateManualAttTimeRequirement();
+    document.getElementById('preview-sheet-btn').addEventListener('click', openPayrollPreview);
+    document.getElementById('close-preview-btn').addEventListener('click', closePayrollPreview);
+    document.getElementById('print-sheet-btn').addEventListener('click', () => window.print());
+    document.getElementById('email-sheet-btn').addEventListener('click', emailPayrollSheet);
+
+    document.getElementById('payslip-period-select').addEventListener('change', (e) => loadPayslipEmployees(e.target.value));
+    document.getElementById('view-payslip-btn').addEventListener('click', viewPayslip);
+    document.getElementById('print-payslip-btn').addEventListener('click', printPayslip);
+
+    document.getElementById('view-report-btn').addEventListener('click', viewReport);
+    document.getElementById('print-report-btn').addEventListener('click', printReport);
+
+    document.getElementById('settings-add-tax-row').addEventListener('click', () => {
+      const tbody = document.getElementById('settings-tax-tbody');
+      const row = document.createElement('tr');
+      row.innerHTML = `
+        <td><input type="number" class="tax-floor" value="0" step="1" min="0" style="width:100px;"></td>
+        <td><input type="number" class="tax-base" value="0" step="0.01" min="0" style="width:100px;"></td>
+        <td><input type="number" class="tax-rate" value="0" step="0.01" min="0" style="width:80px;"></td>
+        <td><button type="button" class="btn-icon" style="color:var(--red);" onclick="this.closest('tr').remove()">Remove</button></td>`;
+      tbody.appendChild(row);
+    });
+
+    document.getElementById('ca-form').addEventListener('submit', createCashAdvance);
+
+    document.getElementById('taxcalc-comp').addEventListener('input', runTaxCalculator);
+    document.getElementById('taxcalc-rate-type').addEventListener('change', runTaxCalculator);
+
+    document.getElementById('settings-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (currentUserRole !== 'admin') return;
+      const btn = document.getElementById('settings-save-btn');
+      btn.disabled = true;
+      btn.textContent = 'Saving…';
+      try {
+        await saveStatutorySettings(collectSettingsPayload());
+        renderSettingsForm();
+        renderTaxTable();
+        alert('Settings saved. New computations will use these values immediately.');
+      } catch (err) {
+        alert('Could not save settings: ' + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Save all settings';
+      }
     });
   });
 
@@ -144,23 +501,61 @@
     e.preventDefault();
     const emp = {
       name: document.getElementById('emp-name').value.trim(),
+      email: document.getElementById('emp-email').value.trim().toLowerCase(),
       position: document.getElementById('emp-position').value.trim(),
       department: document.getElementById('emp-department').value.trim(),
       rate_type: document.getElementById('rate-type').value,
       rate_amount: parseFloat(document.getElementById('rate-amount').value || 0),
-      status: 'active',
       date_hired: document.getElementById('emp-date-hired').value || null,
       sss_no: document.getElementById('emp-sss').value.trim(),
       philhealth_no: document.getElementById('emp-philhealth').value.trim(),
       pagibig_no: document.getElementById('emp-pagibig').value.trim(),
-      tin: document.getElementById('emp-tin').value.trim(),
-      created_at: serverTimestamp()
+      tin: document.getElementById('emp-tin').value.trim()
     };
     if (!emp.name) return;
-    await addDoc(collection(db, 'employees'), emp);
+
+    if (editingEmployeeId) {
+      await updateDoc(doc(db, 'employees', editingEmployeeId), emp);
+      exitEditMode();
+    } else {
+      emp.status = 'active';
+      emp.created_at = serverTimestamp();
+      await addDoc(collection(db, 'employees'), emp);
+    }
     e.target.reset();
     document.getElementById('rate-label').textContent = 'Daily rate (₱)';
   }
+
+  window.__mpEditEmployee = (id) => {
+    const emp = employeesCache.find(e => e.id === id);
+    if (!emp) return;
+    editingEmployeeId = id;
+    document.getElementById('emp-name').value = emp.name || '';
+    document.getElementById('emp-email').value = emp.email || '';
+    document.getElementById('emp-position').value = emp.position || '';
+    document.getElementById('emp-department').value = emp.department || '';
+    document.getElementById('rate-type').value = emp.rate_type || 'daily';
+    document.getElementById('rate-label').textContent = emp.rate_type === 'monthly' ? 'Monthly rate (₱)' : 'Daily rate (₱)';
+    document.getElementById('rate-amount').value = emp.rate_amount || '';
+    document.getElementById('emp-date-hired').value = emp.date_hired || '';
+    document.getElementById('emp-sss').value = emp.sss_no || '';
+    document.getElementById('emp-philhealth').value = emp.philhealth_no || '';
+    document.getElementById('emp-pagibig').value = emp.pagibig_no || '';
+    document.getElementById('emp-tin').value = emp.tin || '';
+
+    document.getElementById('employee-form-title').textContent = `Edit employee — ${emp.name}`;
+    document.getElementById('employee-submit-btn').textContent = 'Save changes';
+    document.getElementById('employee-cancel-btn').classList.remove('hidden');
+    document.getElementById('employee-form').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
+  function exitEditMode() {
+    editingEmployeeId = null;
+    document.getElementById('employee-form-title').textContent = 'Add employee';
+    document.getElementById('employee-submit-btn').textContent = 'Add employee';
+    document.getElementById('employee-cancel-btn').classList.add('hidden');
+  }
+
 
   function loadEmployees() {
     const q = query(collection(db, 'employees'), orderBy('name'));
@@ -173,13 +568,16 @@
         if (d.rate_type === 'daily') dailyCount++; else monthlyCount++;
         rows.push(`
           <tr>
-            <td>${d.name}</td>
+            <td>${d.name}<div style="font-size:11px;color:var(--muted);">${d.email || '—'}</div></td>
             <td>${d.position || '—'}</td>
             <td>${d.department || '—'}</td>
             <td><span class="tag tag-${d.rate_type}">${d.rate_type}</span></td>
             <td class="num">₱${(d.rate_amount || 0).toLocaleString('en-PH', {minimumFractionDigits: 2})}</td>
             <td><span class="status status-${d.status}">${d.status}</span></td>
-            <td><button class="btn-icon" data-id="${docSnap.id}" onclick="__mpDeleteEmployee('${docSnap.id}')">Remove</button></td>
+            <td>
+              <button class="btn-icon" style="color:var(--navy);" onclick='__mpEditEmployee("${docSnap.id}")'>Edit</button>
+              <button class="btn-icon" style="margin-left:10px;" data-id="${docSnap.id}" onclick="__mpDeleteEmployee('${docSnap.id}')">Remove</button>
+            </td>
           </tr>`);
       });
       document.getElementById('employees-tbody').innerHTML = rows.join('') || `<tr><td colspan="7" class="empty">No employees yet. Add your first employee above.</td></tr>`;
@@ -202,60 +600,131 @@
   // Sources: SSS Circular (RA 11199, 15% total / MSC 5,000-35,000, step 500);
   // PhilHealth (5% total, floor 10,000 / ceiling 100,000); Pag-IBIG (HDMF Circular 460, 2% / MFS cap 10,000);
   // BIR withholding (TRAIN Law, RR 11-2018 Annex E, effective Jan 2023, unchanged through 2026).
-  // These are approximations of the official bracket tables — verify against BIR/SSS/PhilHealth/Pag-IBIG
-  // circulars before relying on them for actual remittance.
-  const STATUTORY_2026 = {
-    sss: { rateTotal: 0.15, employeeShare: 0.05, mscFloor: 5000, mscCeiling: 35000, mscStep: 500 },
+  // These are DEFAULTS only — the live values are Firestore-backed (settings/statutory,
+  // see loadStatutorySettings below) and editable from the Settings tab. This object is
+  // overwritten in place once settings load, and re-seeds Firestore on first run.
+  // BIR RR 11-2018 Annex E: monthly withholding table effective 2023 onward.
+  const BIR_MONTHLY_2023 = [
+    { floor: 0,      base: 0,         rate: 0 },
+    { floor: 20833,  base: 0,         rate: .15 },
+    { floor: 33333,  base: 1875,      rate: .20 },
+    { floor: 66667,  base: 8541.80,   rate: .25 },
+    { floor: 166667, base: 33541.80,  rate: .30 },
+    { floor: 666667, base: 183541.80, rate: .35 }
+  ];
+  let STATUTORY_2026 = {
+    sss: { rateTotal: 0.15, employeeShare: 0.05, mscFloor: 5000, mscCeiling: 35000, mscStep: 500, ecThreshold: 15000, ecBelow: 10, ecAtOrAbove: 30 },
     philhealth: { rateTotal: 0.05, employeeShare: 0.025, floor: 10000, ceiling: 100000 },
+    // Pag-IBIG MFS cap is ₱10,000 as of HDMF Circular 460 (effective Feb 2024, current through 2026).
+    // The older ₱5,000 cap / ₱100 max predates that circular — do not revert to it.
     pagibig: { rateLow: 0.01, rateStandard: 0.02, lowThreshold: 1500, mfsCap: 10000 },
-    // Monthly TRAIN withholding brackets: [floor, baseTax, rate]
-    taxMonthly: [
-      { floor: 0,        base: 0,          rate: 0.00 },
-      { floor: 20833,    base: 0,          rate: 0.15 },
-      { floor: 33333,    base: 2500,       rate: 0.20 },
-      { floor: 66667,    base: 10833.33,   rate: 0.25 },
-      { floor: 166667,   base: 40833.33,   rate: 0.30 },
-      { floor: 666667,   base: 200833.33,  rate: 0.35 }
-    ]
+    taxMonthly: BIR_MONTHLY_2023.map(b => ({ ...b }))
   };
+  let NSD_RATE = 0.10; // night shift differential, 10% (Labor Code Art. 86) — Settings-editable
+  let DOLE_DAILY_RATE_FACTOR = 261; // EEMR factor for Monthly-rate daily-equivalent (261 = Mon-Fri, holidays paid) — Settings-editable
 
   // ---------- Payroll calculation engine (shared logic, daily + monthly) ----------
   // Kept here as the seed for shared/payroll-calc.js once the module is split out.
   window.__mpCalc = {
     // Converts a monthly rate to an equivalent daily rate for OT / holiday pay math.
-    getDailyRateEquivalent(employee, divisor = 26) {
+    // Confirmed policy: Mechatrade's Monthly-rate staff work Mon–Fri with paid
+    // holidays — per the DOLE-BWC Handbook on Workers' Statutory Monetary
+    // Benefits (EEMR method), that's Factor 261. Formula: (Monthly Rate × 12) ÷
+    // Factor. DOLE_DAILY_RATE_FACTOR is Settings-editable in case the actual
+    // work schedule differs (365 = paid every day; 313 = 6-day week).
+    getDailyRateEquivalent(employee) {
       if (employee.rate_type === 'daily') return employee.rate_amount;
-      return employee.rate_amount / divisor;
+      return (employee.rate_amount * 12) / DOLE_DAILY_RATE_FACTOR;
     },
-    basicPay(employee, daysPresent, divisor = 26) {
-      if (employee.rate_type === 'daily') return employee.rate_amount * daysPresent;
-      return this.getDailyRateEquivalent(employee, divisor) * daysPresent;
-    },
-    overtimePay(employee, otHours, divisor = 26, hoursPerDay = 8, otMultiplier = 1.25) {
-      const hourlyRate = this.getDailyRateEquivalent(employee, divisor) / hoursPerDay;
+    overtimePay(employee, otHours, hoursPerDay = 8, otMultiplier = 1.25) {
+      const hourlyRate = this.getDailyRateEquivalent(employee) / hoursPerDay;
       return hourlyRate * otHours * otMultiplier;
     },
-    // Monthly-equivalent compensation, used as the base for statutory contributions
-    // when an employee is paid on a daily rate (annualized to a monthly figure).
+    // Monthly-equivalent compensation. Kept for reference/other callers, but
+    // statutory contributions no longer use this directly — see actualMonthlyComp
+    // below for why.
     monthlyEquivalent(employee, divisor = 26, workingDaysPerMonth = 26) {
       if (employee.rate_type === 'monthly') return employee.rate_amount;
       return employee.rate_amount * workingDaysPerMonth;
     },
+    // Statutory base: what the employee ACTUALLY earned this cutoff (basic pay,
+    // before OT/holiday/other add-ons), projected to a monthly figure the same
+    // way the period is normally annualized (×2 for semi-monthly, ×1 for a
+    // monthly-type cutoff which already spans the full month).
+    // Using the nominal contracted rate here (the old approach) overcharges
+    // SSS/PhilHealth/Pag-IBIG for anyone on extended unpaid leave — they'd be
+    // billed as if they earned a full month's pay when they actually earned
+    // close to ₱0, producing deductions that exceed gross pay.
+    // Caveat: on the second cutoff (where the full month's statutory amount
+    // posts), this only reflects the SECOND cutoff's actual earnings, not the
+    // sum of both cutoffs in the month — a reasonable approximation, but if the
+    // two cutoffs differ a lot in attendance it won't be exact either.
+    actualMonthlyComp(basicEarnedThisCutoff, period) {
+      const cutoffsPerMonth = period.period_type === 'monthly' ? 1 : 2;
+      return Math.max(basicEarnedThisCutoff, 0) * cutoffsPerMonth;
+    },
+
+    // ---- Statutory engine: Contribution Month → Monthly Compensation → SSS MSC → SSS/PhilHealth/Pag-IBIG → Employee/Employer shares ----
+    contributionMonth(period) {
+      return period.cutoff_start ? period.cutoff_start.slice(0, 7) : null; // 'YYYY-MM'
+    },
+    // A semi-monthly period is either the FIRST or SECOND cutoff of its month.
+    // Mechatrade's actual calendar: cutoff 1 runs ~29th of the PRIOR month
+    // through the 13th (payday the 15th); cutoff 2 runs the 14th through the
+    // 28th (payday the 30th). cutoff_start's day-of-month varies (27th/28th/
+    // 29th/30th depending on how long the prior month is), so it's an
+    // unreliable anchor — cutoff_end is consistently ~13th or ~28th, so
+    // position is determined from THAT instead. A monthly period_type has
+    // only one cutoff, so it's always 'full'.
+    determineCutoffPosition(period) {
+      if (period.period_type === 'monthly') return 'full';
+      const day = new Date(period.cutoff_end + 'T00:00:00Z').getUTCDate();
+      return day <= 15 ? 'first' : 'second';
+    },
+    // Confirmed rule: employee statutory deduction is 0 on the first cutoff
+    // of the month, and the FULL monthly amount on the second cutoff.
+    statutoryCutoffMultiplier(period) {
+      const position = this.determineCutoffPosition(period);
+      return position === 'first' ? 0 : 1;
+    },
+    sssMSC(monthlyComp) {
+      const t = STATUTORY_2026.sss;
+      return Math.min(Math.max(Math.ceil(monthlyComp / t.mscStep) * t.mscStep, t.mscFloor), t.mscCeiling);
+    },
     sssEmployeeShare(monthlyComp) {
       const t = STATUTORY_2026.sss;
-      const msc = Math.min(Math.max(Math.ceil(monthlyComp / t.mscStep) * t.mscStep, t.mscFloor), t.mscCeiling);
-      return Math.round(msc * t.employeeShare * 100) / 100;
+      return Math.round(this.sssMSC(monthlyComp) * t.employeeShare * 100) / 100;
+    },
+    sssEmployerShare(monthlyComp) {
+      const t = STATUTORY_2026.sss;
+      return Math.round(this.sssMSC(monthlyComp) * (t.rateTotal - t.employeeShare) * 100) / 100;
+    },
+    // Employer-only fixed EC (Employees' Compensation) premium, on top of the 10% employer SS share.
+    sssEC(monthlyComp) {
+      const t = STATUTORY_2026.sss;
+      return this.sssMSC(monthlyComp) >= t.ecThreshold ? t.ecAtOrAbove : t.ecBelow;
     },
     philhealthEmployeeShare(monthlyComp) {
       const t = STATUTORY_2026.philhealth;
       const base = Math.min(Math.max(monthlyComp, t.floor), t.ceiling);
       return Math.round(base * t.employeeShare * 100) / 100;
     },
+    philhealthEmployerShare(monthlyComp) {
+      const t = STATUTORY_2026.philhealth;
+      const base = Math.min(Math.max(monthlyComp, t.floor), t.ceiling);
+      return Math.round(base * (t.rateTotal - t.employeeShare) * 100) / 100;
+    },
     pagibigEmployeeShare(monthlyComp) {
       const t = STATUTORY_2026.pagibig;
       const base = Math.min(monthlyComp, t.mfsCap);
       const rate = monthlyComp <= t.lowThreshold ? t.rateLow : t.rateStandard;
       return Math.round(base * rate * 100) / 100;
+    },
+    pagibigEmployerShare(monthlyComp) {
+      // Employer matches the standard 2% rate regardless of the employee's low-income rate.
+      const t = STATUTORY_2026.pagibig;
+      const base = Math.min(monthlyComp, t.mfsCap);
+      return Math.round(base * t.rateStandard * 100) / 100;
     },
     withholdingTax(monthlyTaxableIncome) {
       const brackets = STATUTORY_2026.taxMonthly;
@@ -264,27 +733,1042 @@
       const tax = bracket.base + (monthlyTaxableIncome - bracket.floor) * bracket.rate;
       return Math.round(Math.max(tax, 0) * 100) / 100;
     },
+
+    // ---- DOLE day-type pay premiums (Labor Code Arts. 87-94 + annual holiday
+    // pay Labor Advisories) ----
+    // Multiplier on the DAILY rate for a worked day of this type.
+    DAY_TYPE_WORKED_MULTIPLIER: {
+      regular: 1.0,
+      rest_day: 1.30,
+      special_non_working: 1.30,
+      special_rest_day: 1.50,
+      regular_holiday: 2.00,
+      regular_holiday_rest_day: 2.60,
+      double_holiday: 3.00,
+      // Not explicitly spelled out in every advisory — extrapolated
+      // consistently with the rest-day stacking pattern (300% x 130%).
+      // Confirm against that year's specific advisory if this combo comes up.
+      double_holiday_rest_day: 3.90
+    },
+    // Extra multiplier on the hourly rate for OT hours on that day type —
+    // stacks the day's worked multiplier with the OT premium (130% for rest/
+    // special days, +30% on the holiday rate for holidays).
+    DAY_TYPE_OT_MULTIPLIER: {
+      regular: 1.25,
+      rest_day: 1.30 * 1.30,
+      special_non_working: 1.30 * 1.30,
+      special_rest_day: 1.50 * 1.30,
+      regular_holiday: 2.00 * 1.30,
+      regular_holiday_rest_day: 2.60 * 1.30,
+      double_holiday: 3.00 * 1.30,
+      double_holiday_rest_day: 3.90 * 1.30
+    },
+    // Minutes of [startDate, endDate) that fall inside the 10PM-6AM PH
+    // window — computed on PH wall-clock time (UTC+8, no DST) regardless of
+    // the browser's own timezone, and correct across a shift that crosses
+    // midnight or spans multiple nights.
+    nightShiftMinutes(startDate, endDate) {
+      const OFFSET = 8 * 3600 * 1000;
+      const s = startDate.getTime() + OFFSET;
+      const e = endDate.getTime() + OFFSET;
+      let total = 0;
+      let dayStart = Math.floor(s / 86400000) * 86400000;
+      while (dayStart < e) {
+        const nightStart = dayStart + 22 * 3600000;
+        const nightEnd = dayStart + 30 * 3600000;
+        const overlapStart = Math.max(s, nightStart);
+        const overlapEnd = Math.min(e, nightEnd);
+        if (overlapEnd > overlapStart) total += (overlapEnd - overlapStart) / 60000;
+        dayStart += 86400000;
+      }
+      return Math.round(total);
+    },
+    // Aggregates one employee's saved attendance days for a period into the
+    // three DOLE premium totals Payroll Processing pre-fills from: holiday
+    // pay, rest-day pay, and night shift differential. OT itself is handled
+    // separately via a blended multiplier (see otMultiplierForDays below) so
+    // the existing "OT hours" input stays editable and meaningful.
+    //
+    // Daily-rate vs monthly-rate distinction: a daily-rate employee's basic
+    // pay already counts a worked special day as 1 payable day (100%), so
+    // only the PREMIUM portion (multiplier − 1) is added here. A monthly-
+    // rate employee's salary doesn't cover rest days or special days at all,
+    // so a worked one adds the FULL amount — except worked regular/double
+    // holidays, which are conventionally deemed already included in monthly
+    // salary, so only the premium portion is added there too. Unworked
+    // holidays add nothing extra for monthly staff (already salaried) and
+    // are covered via the payable-days count for daily staff.
+    computeSpecialDayPay(days, employee) {
+      const dailyRate = this.getDailyRateEquivalent(employee);
+      const hourlyRate = dailyRate / 8;
+      const isMonthly = employee.rate_type === 'monthly';
+      let holidayPay = 0, restDayPay = 0, nsdPay = 0;
+
+      (days || []).forEach(d => {
+        const dayType = d.day_type || 'regular';
+        const worked = !d.is_leave;
+        const regMin = Math.round((d.regular_hours || 0) * 60);
+        const otMin = Math.round((d.ot_hours || 0) * 60);
+        const nightMin = d.night_minutes || 0;
+        const workedMult = this.DAY_TYPE_WORKED_MULTIPLIER[dayType] ?? 1;
+        const otMult = this.DAY_TYPE_OT_MULTIPLIER[dayType] ?? 1.25;
+        const isHolidayType = dayType.startsWith('regular_holiday') || dayType.startsWith('double_holiday');
+        const isRestOrSpecialType = dayType === 'rest_day' || dayType === 'special_non_working' || dayType === 'special_rest_day';
+
+        if (worked && (isHolidayType || isRestOrSpecialType)) {
+          const premiumOnly = dailyRate * (workedMult - 1);
+          const fullAmount = dailyRate * workedMult;
+          const amount = isMonthly ? (isHolidayType ? premiumOnly : fullAmount) : premiumOnly;
+          if (isHolidayType) holidayPay += amount; else restDayPay += amount;
+        }
+        // Unworked regular/double holiday (attendance_status HOLIDAY_PAID):
+        // daily-rate gets it via the payable-days count already; monthly-
+        // rate is deemed already covered by salary. Nothing added here.
+
+        // Night differential — 10% of whichever rate applied to those
+        // specific minutes, split between the regular/OT buckets assuming
+        // regular hours are worked first chronologically.
+        const nightInRegular = Math.min(nightMin, regMin);
+        const nightInOT = Math.max(Math.min(nightMin, regMin + otMin) - regMin, 0);
+        nsdPay += (nightInRegular / 60) * hourlyRate * workedMult * NSD_RATE
+                + (nightInOT / 60) * hourlyRate * otMult * NSD_RATE;
+      });
+
+      return {
+        holidayPay: Math.round(holidayPay * 100) / 100,
+        restDayPay: Math.round(restDayPay * 100) / 100,
+        nsdPay: Math.round(nsdPay * 100) / 100
+      };
+    },
+    // Blended OT multiplier across all of a period's saved attendance days —
+    // lets the "OT hours" input stay a single editable number while still
+    // reflecting correct DOLE stacking (a rest-day or holiday OT hour costs
+    // more than an ordinary one) instead of a flat 125% for everything.
+    // Falls back to plain 125% when there's no attendance data to blend from.
+    otMultiplierForDays(days, employee) {
+      const hourlyRate = this.getDailyRateEquivalent(employee) / 8;
+      let totalOtHours = 0, totalOtPay = 0;
+      (days || []).forEach(d => {
+        const otHours = d.ot_hours || 0;
+        if (!otHours) return;
+        const otMult = this.DAY_TYPE_OT_MULTIPLIER[d.day_type || 'regular'] ?? 1.25;
+        totalOtHours += otHours;
+        totalOtPay += otHours * hourlyRate * otMult;
+      });
+      if (totalOtHours <= 0) return 1.25;
+      return totalOtPay / (totalOtHours * hourlyRate);
+    },
+
     // Full record for one employee in one payroll period.
-    // periodFactor: 1 for monthly cutoff, 0.5 for semi-monthly (statutory bases are halved per cutoff).
-    computeRecord(employee, { daysPresent, otHours, allowances = 0, otherDeductions = 0 }, periodFactor = 0.5, divisor = 26) {
-      const basic = this.basicPay(employee, daysPresent, divisor);
-      const ot = this.overtimePay(employee, otHours, divisor);
-      const gross = basic + ot + allowances;
-      const monthlyComp = this.monthlyEquivalent(employee, divisor);
-      const sss = this.sssEmployeeShare(monthlyComp) * periodFactor;
-      const philhealth = this.philhealthEmployeeShare(monthlyComp) * periodFactor;
-      const pagibig = this.pagibigEmployeeShare(monthlyComp) * periodFactor;
-      const taxableIncome = Math.max(monthlyComp - (sss + philhealth + pagibig) / periodFactor, 0);
-      const tax = this.withholdingTax(taxableIncome) * periodFactor;
-      const totalDeductions = sss + philhealth + pagibig + tax + otherDeductions;
-      const net = gross - totalDeductions;
-      return { basic, ot, allowances, gross, sss, philhealth, pagibig, tax, otherDeductions, totalDeductions, net };
+    // inputs (monthly-rate): { otHours, otMultiplier, holidayPay, restDayPay, nsdPay, otherEarnings, unpaidDays, otherDeductions }
+    // inputs (daily-rate):   { otHours, otMultiplier, holidayPay, restDayPay, nsdPay, otherEarnings, payableDays, otherDeductions }
+    // otMultiplier: blended DOLE-stacked OT rate from otMultiplierForDays() — defaults to plain 125% (Art. 87) when not supplied.
+    computeRecord(employee, inputs, period) {
+      const ot = this.overtimePay(employee, inputs.otHours || 0, 8, inputs.otMultiplier || 1.25);
+      const holidayPay = inputs.holidayPay || 0;
+      const restDayPay = inputs.restDayPay || 0;
+      const nsdPay = inputs.nsdPay || 0;
+      const otherEarnings = inputs.otherEarnings || 0;
+      const otherDeductions = inputs.otherDeductions || 0;
+      const cashAdvanceDeduction = inputs.cashAdvanceDeduction || 0;
+
+      let basic, unpaidDeduction = 0;
+      if (employee.rate_type === 'monthly') {
+        const semiMonthlyBase = employee.rate_amount / 2;
+        const dailyEquivalent = this.getDailyRateEquivalent(employee); // DOLE EEMR factor, not a flat ÷26
+        unpaidDeduction = (inputs.unpaidDays || 0) * dailyEquivalent;
+        basic = semiMonthlyBase;
+      } else {
+        basic = employee.rate_amount * (inputs.payableDays || 0);
+      }
+      // Rest-day pay and NSD apply the same way regardless of rate type —
+      // a monthly-rate employee's salary doesn't cover a worked rest day
+      // any more than a daily-rate one's does. See computeSpecialDayPay for
+      // how these amounts get pre-filled.
+      let gross = basic - unpaidDeduction + ot + holidayPay + restDayPay + nsdPay + otherEarnings;
+
+      // Actual basic pay earned THIS cutoff, net of unpaid days — not the
+      // `basic` above, which for monthly-rate employees is still the nominal
+      // half-month salary before the unpaid-days deduction is applied.
+      const basicEarned = Math.max(basic - unpaidDeduction, 0);
+      const monthlyComp = this.actualMonthlyComp(basicEarned, period);
+      const cutoffPosition = this.determineCutoffPosition(period);
+      // No compensation earned this cutoff (e.g. a full unpaid-leave cutoff)
+      // → no statutory contribution is due, full stop. Without this, SSS/
+      // PhilHealth's own minimum-base floors (₱5,000 MSC / ₱10,000 income)
+      // would still charge a baseline deduction against ₱0 of actual pay.
+      const statutoryMultiplier = basicEarned <= 0 ? 0 : this.statutoryCutoffMultiplier(period);
+
+      const sss = this.sssEmployeeShare(monthlyComp) * statutoryMultiplier;
+      const sssEmployer = this.sssEmployerShare(monthlyComp) * statutoryMultiplier;
+      const sssEC = this.sssEC(monthlyComp) * statutoryMultiplier;
+      const philhealth = this.philhealthEmployeeShare(monthlyComp) * statutoryMultiplier;
+      const philhealthEmployer = this.philhealthEmployerShare(monthlyComp) * statutoryMultiplier;
+      const pagibig = this.pagibigEmployeeShare(monthlyComp) * statutoryMultiplier;
+      const pagibigEmployer = this.pagibigEmployerShare(monthlyComp) * statutoryMultiplier;
+
+      // Withholding tax now follows the SAME first/second-cutoff rule as
+      // SSS/PhilHealth/Pag-IBIG (confirmed policy: zero deduction of any kind
+      // on the first cutoff, full monthly amount on the second) — no longer
+      // split 50/50 across both cutoffs.
+      const taxableIncome = Math.max(monthlyComp - (this.sssEmployeeShare(monthlyComp) + this.philhealthEmployeeShare(monthlyComp) + this.pagibigEmployeeShare(monthlyComp)), 0);
+      const tax = this.withholdingTax(taxableIncome) * statutoryMultiplier;
+
+      const totalDeductions = sss + philhealth + pagibig + tax + cashAdvanceDeduction + otherDeductions;
+      const grossRaw = gross;
+      gross = Math.max(gross, 0);
+      const netRaw = gross - totalDeductions;
+      const net = Math.max(netRaw, 0);
+      const needsReview = grossRaw < 0 || netRaw < 0;
+
+      return {
+        basic, ot, holidayPay, restDayPay, nsdPay, otherEarnings,
+        unpaidDeduction,
+        gross, grossRaw, sss, sssEmployer, sssEC, philhealth, philhealthEmployer, pagibig, pagibigEmployer, tax,
+        cashAdvanceDeduction, otherDeductions, totalDeductions, net, netRaw, needsReview,
+        contributionMonth: this.contributionMonth(period), cutoffPosition
+      };
     }
   };
 
-  // ---------- Payroll Processing ----------
+  // ---------- Shared state ----------
   let currentPeriodId = null;
   let employeesCache = [];
+  let periodsCache = [];
+  let editingEmployeeId = null;
+
+  // ---------- Attendance (per-day records, pulled from Mechatrade PulseTime) ----------
+  // Business rules (confirmed): standard day = 8 worked hours + 1hr unpaid lunch,
+  // no fixed clock-in time (so "Late" isn't auto-computed from raw punches —
+  // it stays 0/manual unless corrected). A calendar day with zero PulseTime
+  // entries auto-flags as Leave and defaults to Unpaid Leave — override the
+  // dropdown per day if it was actually Paid Leave, Emergency Leave, etc.
+  // Only PAID LEAVE counts as a paid day in payroll; UNPAID LEAVE,
+  // EMERGENCY LEAVE, and HALF DAY do not auto-count toward basic pay.
+  const ATTENDANCE_STATUSES = [
+    { value: '', label: '— select —' },
+    { value: 'PRESENT', label: 'Present' },
+    { value: 'PAID_LEAVE', label: 'Paid Leave' },
+    { value: 'UNPAID_LEAVE', label: 'Unpaid Leave' },
+    { value: 'EMERGENCY_LEAVE', label: 'Emergency Leave' },
+    { value: 'HALF_DAY', label: 'Half Day' },
+    { value: 'HOLIDAY_PAID', label: 'Holiday (paid, not worked)' }
+  ];
+
+  let pulledDays = null; // array of { employeeId, employeeName, date, timeIn, timeOut, regularHours, otHours, undertimeMinutes, isLeave, attendanceStatus }
+  let pulledUnmatched = [];
+  let pulledWeekendClears = []; // array of { employeeId, date } — unworked Sat/Sun days to purge from Firestore on save
+
+  // ---- Philippine-time (Asia/Manila, UTC+8, no DST) helpers ----
+  // PulseTime and payroll both operate on PH calendar days. Everything below
+  // is anchored explicitly to Asia/Manila so results don't depend on whatever
+  // timezone the admin's own browser/OS happens to be set to — without this,
+  // a daytime PH shift can render as a fabricated overnight shift (browser-
+  // local display formatting) or get filed under the wrong calendar day
+  // (naive UTC-based bucketing), even though the underlying instant is right.
+  function phDateKey(date) {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
+  }
+  function phTimeHHMM(date) {
+    return new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Manila', hour: '2-digit', minute: '2-digit', hour12: false }).format(date);
+  }
+  // Office schedule is Mon–Fri; a plain 'YYYY-MM-DD' dateKey parsed at UTC
+  // midnight gives a timezone-independent day-of-week (0=Sun..6=Sat) — same
+  // trick as dateRangeInclusive below.
+  function isWeekend(dateKey) {
+    const dow = new Date(dateKey + 'T00:00:00Z').getUTCDay();
+    return dow === 0 || dow === 6;
+  }
+
+  // ---------- Holiday calendar (DOLE regular holidays / special non-working days) ----------
+  const HOLIDAY_TYPE_LABELS = {
+    regular: 'Regular Holiday',
+    special_non_working: 'Special (Non-working) Day',
+    double: 'Double Holiday'
+  };
+  let holidaysCache = [];
+  let holidaysByDate = {}; // dateKey -> { type, label }
+
+  function loadHolidays() {
+    const q = query(collection(db, 'holidays'), orderBy('date'));
+    onSnapshot(q, (snap) => {
+      holidaysCache = [];
+      holidaysByDate = {};
+      snap.forEach(d => {
+        const data = { id: d.id, ...d.data() };
+        holidaysCache.push(data);
+        holidaysByDate[data.date] = { type: data.type, label: data.label || '' };
+      });
+      renderHolidaysTable();
+    });
+  }
+
+  function renderHolidaysTable() {
+    const tbody = document.getElementById('holidays-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = holidaysCache.map(h => `
+      <tr>
+        <td>${h.date}</td>
+        <td>${HOLIDAY_TYPE_LABELS[h.type] || h.type}</td>
+        <td>${h.label || '—'}</td>
+        <td><button class="btn-icon" onclick='__mpDeleteHoliday("${h.id}")'>Delete</button></td>
+      </tr>`).join('') || '<tr><td colspan="4" class="empty">No holidays declared yet.</td></tr>';
+  }
+
+  async function addHoliday(e) {
+    e.preventDefault();
+    const date = document.getElementById('holiday-date').value;
+    const type = document.getElementById('holiday-type').value;
+    const label = document.getElementById('holiday-label').value.trim();
+    if (!date) return;
+    // Doc id = the date itself, so re-declaring the same date just updates it.
+    await setDoc(doc(db, 'holidays', date), { date, type, label, updated_at: serverTimestamp() });
+    e.target.reset();
+  }
+
+  window.__mpDeleteHoliday = async (id) => {
+    if (!confirm('Remove this holiday from the calendar?')) return;
+    await deleteDoc(doc(db, 'holidays', id));
+  };
+
+  // Classifies a calendar date into the DOLE day-type categories used for pay
+  // premium computation, combining the holiday calendar with the Mon–Fri
+  // office schedule (Sat/Sun = rest day for everyone, since per-employee rest
+  // days aren't tracked separately).
+  function classifyDay(dateKey) {
+    const h = holidaysByDate[dateKey];
+    const rest = isWeekend(dateKey);
+    if (h) {
+      if (h.type === 'double') return rest ? 'double_holiday_rest_day' : 'double_holiday';
+      if (h.type === 'regular') return rest ? 'regular_holiday_rest_day' : 'regular_holiday';
+      if (h.type === 'special_non_working') return rest ? 'special_rest_day' : 'special_non_working';
+    }
+    return rest ? 'rest_day' : 'regular';
+  }
+
+  function dateRangeInclusive(startStr, endStr) {
+    // Pure calendar-date arithmetic — anchored to UTC ('Z') so day-stepping
+    // never depends on the browser's local timezone (a local-midnight Date in
+    // an east-of-UTC zone like PH can otherwise roll back a calendar day).
+    const dates = [];
+    let d = new Date(startStr + 'T00:00:00Z');
+    const end = new Date(endStr + 'T00:00:00Z');
+    while (d <= end) {
+      dates.push(d.toISOString().slice(0, 10));
+      d.setUTCDate(d.getUTCDate() + 1);
+    }
+    return dates;
+  }
+
+  async function pullFromPulseTime() {
+    const periodId = document.getElementById('att-period-select').value;
+    if (!periodId) { alert('Select a payroll period first.'); return; }
+    const period = periodsCache.find(p => p.id === periodId);
+    if (!period) return;
+
+    const btn = document.getElementById('pull-pulsetime-btn');
+    btn.disabled = true;
+    btn.textContent = 'Pulling…';
+
+    try {
+      await ensureTimetrackerAuth();
+      // Anchored to +08:00 explicitly — PH calendar-day boundaries, not
+      // whatever midnight the admin's browser timezone would compute.
+      const cutoffStart = new Date(period.cutoff_start + 'T00:00:00+08:00');
+      const cutoffEnd = new Date(period.cutoff_end + 'T23:59:59+08:00');
+      // Single-field range filter on `start` — no composite index needed,
+      // and this alone cuts reads down to just this cutoff's entries instead
+      // of pulling PulseTime's entire history on every pull.
+      const q = query(collection(dbTimetracker, 'tt_entries'),
+        where('start', '>=', cutoffStart), where('start', '<=', cutoffEnd));
+      const snap = await getDocs(q);
+      // byEmailDate[email][date] = { spanMinutes, earliestStart, latestEnd, sessionCount }
+      const byEmailDate = {};
+      const unmatchedEmails = new Set();
+      snap.forEach(docSnap => {
+        const d = docSnap.data();
+        if (!d.start || !d.end || !d.ownerEmail) return;
+        const start = d.start.toDate();
+        const end = d.end.toDate();
+        if (start < cutoffStart || start > cutoffEnd) return;
+        const email = d.ownerEmail.toLowerCase();
+        const dateKey = phDateKey(start); // PH calendar date, not raw UTC date
+        if (!byEmailDate[email]) byEmailDate[email] = {};
+        if (!byEmailDate[email][dateKey]) byEmailDate[email][dateKey] = { spanMinutes: 0, earliestStart: start, latestEnd: end, sessionCount: 0 };
+        const bucket = byEmailDate[email][dateKey];
+        bucket.spanMinutes += (end - start) / 60000;
+        bucket.sessionCount += 1;
+        if (start < bucket.earliestStart) bucket.earliestStart = start;
+        if (end > bucket.latestEnd) bucket.latestEnd = end;
+        if (!employeesCache.find(e => (e.email || '').toLowerCase() === email)) unmatchedEmails.add(email);
+      });
+
+      const dates = dateRangeInclusive(period.cutoff_start, period.cutoff_end);
+      const activeEmployees = employeesCache.filter(e => e.status === 'active' && e.email);
+      const rows = [];
+      // Rest days / special non-working days with no actual work — these
+      // should NOT count as leave/absence ("no work, no pay" days that were
+      // never scheduled to begin with), so they're excluded from `rows`
+      // entirely rather than defaulted to Unpaid Leave. Tracked separately
+      // so save can clean up any such records a previous pull/save may have
+      // already written before this rule existed.
+      const weekendNonWorkDays = [];
+
+      activeEmployees.forEach(emp => {
+        const email = emp.email.toLowerCase();
+        dates.forEach(dateKey => {
+          const dayType = classifyDay(dateKey);
+          const entry = byEmailDate[email] && byEmailDate[email][dateKey];
+          if (entry) {
+            // Only assume an unpaid lunch was taken (and deduct 1hr) when the
+            // day is ONE continuous session over an hour — if there are 2+
+            // separate PulseTime sessions that day, the gap between them
+            // already represents the break, so deducting again would double-
+            // count it and understate hours actually worked.
+            const lunchMinutes = (entry.sessionCount === 1 && entry.spanMinutes > 60) ? 60 : 0;
+            const workedMinutes = Math.max(entry.spanMinutes - lunchMinutes, 0);
+            const nightMinutes = window.__mpCalc.nightShiftMinutes(entry.earliestStart, entry.latestEnd);
+
+            // Confirmed policy: a plain worked Saturday/Sunday (no holiday
+            // declared) is NOT treated as rest-day-premium pay. For a
+            // Monthly-rate employee it's folded entirely into OT hours
+            // instead (their salary already covers weekdays, and a weekend
+            // is simply extra time on top). For a Daily-rate employee it's
+            // just an ordinary worked day — counts toward Payable Days like
+            // any weekday, split into regular/OT the normal way, no premium.
+            // Either way, dayType is downgraded to 'regular' so
+            // computeSpecialDayPay doesn't ALSO add a rest-day premium on
+            // top of this. Holiday-weekend combos (e.g. regular_holiday_
+            // rest_day) are untouched — this only applies to a plain weekend.
+            const isPlainWeekend = dayType === 'rest_day';
+            const effectiveDayType = isPlainWeekend ? 'regular' : dayType;
+            let regularMinutes, otMinutes;
+            if (isPlainWeekend && emp.rate_type === 'monthly') {
+              regularMinutes = 0;
+              otMinutes = workedMinutes;
+            } else {
+              regularMinutes = Math.min(workedMinutes, 8 * 60);
+              otMinutes = Math.max(workedMinutes - 8 * 60, 0);
+            }
+            const undertimeMinutes = Math.max(8 * 60 - workedMinutes, 0);
+            // Auto-classify: ~4 worked hours reads as a half day; anything
+            // else with actual time in/out (including a full 8hrs) reads as
+            // Present. Admin can still override via the dropdown. This
+            // applies on weekends/holidays too — if someone actually worked
+            // a rest day or holiday, it's still a paid worked day, and the
+            // holiday/rest-day premium is computed automatically from
+            // `dayType` in Payroll Processing.
+            const autoStatus = (workedMinutes >= 180 && workedMinutes <= 300) ? 'HALF_DAY' : 'PRESENT';
+            rows.push({
+              employeeId: emp.id, employeeName: emp.name, date: dateKey,
+              timeIn: entry.earliestStart.toISOString(), timeOut: entry.latestEnd.toISOString(),
+              regularHours: Math.round((regularMinutes / 60) * 100) / 100,
+              otHours: Math.round((otMinutes / 60) * 100) / 100,
+              lateMinutes: 0,
+              undertimeMinutes: Math.round(undertimeMinutes),
+              nightMinutes,
+              isLeave: false, attendanceStatus: autoStatus, dayType: effectiveDayType
+            });
+          } else if (dayType === 'rest_day' || dayType === 'special_non_working' || dayType === 'special_rest_day') {
+            weekendNonWorkDays.push({ employeeId: emp.id, date: dateKey });
+          } else if (dayType === 'regular_holiday' || dayType === 'regular_holiday_rest_day' || dayType === 'double_holiday' || dayType === 'double_holiday_rest_day') {
+            // Unworked but DOLE-paid holiday — not an absence, not a manual
+            // leave choice. Daily-rate staff get it via the payable-days
+            // count (is_leave: false); monthly-rate staff are deemed already
+            // covered by salary (computeSpecialDayPay adds nothing extra).
+            rows.push({
+              employeeId: emp.id, employeeName: emp.name, date: dateKey,
+              timeIn: null, timeOut: null, regularHours: 0, otHours: 0,
+              lateMinutes: 0, undertimeMinutes: 0, nightMinutes: 0,
+              isLeave: false, attendanceStatus: 'HOLIDAY_PAID', dayType
+            });
+          } else {
+            rows.push({
+              employeeId: emp.id, employeeName: emp.name, date: dateKey,
+              timeIn: null, timeOut: null, regularHours: 0, otHours: 0,
+              lateMinutes: 0, undertimeMinutes: 0, nightMinutes: 0,
+              isLeave: true, attendanceStatus: 'UNPAID_LEAVE', dayType
+            });
+          }
+        });
+      });
+
+      pulledDays = rows;
+      pulledWeekendClears = weekendNonWorkDays;
+      pulledUnmatched = Array.from(unmatchedEmails);
+      renderAttendanceSummary();
+    } catch (err) {
+      alert('Could not read PulseTime data: ' + err.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Pull from PulseTime';
+    }
+  }
+
+  function renderAttendanceSummary() {
+    const wrap = document.getElementById('attendance-summary-wrap');
+    wrap.classList.remove('hidden');
+    const statusOptions = (selected) => ATTENDANCE_STATUSES.map(s =>
+      `<option value="${s.value}" ${s.value === selected ? 'selected' : ''}>${s.label}</option>`).join('');
+    const fmtTime = (iso) => iso ? new Date(iso).toLocaleString('en-PH', { timeZone: 'Asia/Manila', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—';
+
+    const byEmployee = {}; // employeeId -> { name, rows: [{r, idx}] }
+    (pulledDays || []).forEach((r, idx) => {
+      if (!byEmployee[r.employeeId]) byEmployee[r.employeeId] = { name: r.employeeName, rows: [] };
+      byEmployee[r.employeeId].rows.push({ r, idx });
+    });
+
+    const groups = Object.entries(byEmployee).map(([empId, group]) => {
+      const leaveCount = group.rows.filter(x => x.r.isLeave).length;
+      const missingCount = group.rows.filter(x => x.r.isLeave && !x.r.attendanceStatus).length;
+      const otTotal = Math.round(group.rows.reduce((sum, x) => sum + (x.r.otHours || 0), 0) * 100) / 100;
+      const presentCount = group.rows.filter(x => !x.r.isLeave).length;
+
+      const detailRows = group.rows.map(({ r, idx }) => `
+        <tr class="att-detail-row" data-emp="${empId}" style="display:none;">
+          <td></td>
+          <td style="color:var(--muted);">${r.date}</td>
+          <td>${fmtTime(r.timeIn)}</td>
+          <td>${fmtTime(r.timeOut)}</td>
+          <td class="num">${r.regularHours}</td>
+          <td class="num">${r.otHours}</td>
+          <td class="num">${r.undertimeMinutes}</td>
+          <td>${r.isLeave ? '<span class="tag" style="border-color:var(--red); color:var(--red);">Leave</span>' : '—'}</td>
+          <td>${buildPayFlagsHtml({ ot_hours: r.otHours, undertime_minutes: r.undertimeMinutes, night_minutes: r.nightMinutes }) || '<span style="color:var(--muted); font-size:11px;">—</span>'}</td>
+          <td>
+            <select class="att-status-select" data-idx="${idx}" style="width:100%; padding:6px 8px; border:1px solid var(--line); background:${r.isLeave ? '#FFF8EC' : 'var(--paper)'}; font-family:inherit; font-size:12.5px;">
+              ${statusOptions(r.attendanceStatus)}
+            </select>
+          </td>
+        </tr>`).join('');
+
+      return `
+        <tr class="att-group-header" data-toggle="${empId}" style="cursor:pointer; background:var(--paper);">
+          <td colspan="2"><span class="att-chevron" data-chevron="${empId}" style="display:inline-block; width:12px;">▸</span> <strong>${group.name}</strong></td>
+          <td colspan="2" style="color:var(--muted); font-size:12px;">${presentCount} present-day rows · ${leaveCount} leave</td>
+          <td colspan="2" class="num" style="color:var(--muted); font-size:12px;">OT: ${otTotal}h</td>
+          <td colspan="4" style="color:${missingCount ? 'var(--red)' : 'var(--muted)'}; font-size:12px;">${missingCount ? missingCount + ' need a status' : 'All classified'}</td>
+        </tr>
+        ${detailRows}`;
+    }).join('');
+
+    document.getElementById('attendance-summary-tbody').innerHTML = groups || `<tr><td colspan="10" class="empty">No active employees with an email on file, or no data for this cutoff.</td></tr>`;
+
+    document.querySelectorAll('.att-group-header').forEach(header => {
+      header.addEventListener('click', () => {
+        const empId = header.dataset.toggle;
+        const chevron = document.querySelector(`[data-chevron="${empId}"]`);
+        const isOpen = chevron.textContent === '▾';
+        document.querySelectorAll(`.att-detail-row[data-emp="${empId}"]`).forEach(row => {
+          row.style.display = isOpen ? 'none' : 'table-row';
+        });
+        chevron.textContent = isOpen ? '▸' : '▾';
+      });
+    });
+
+    document.querySelectorAll('.att-status-select').forEach(sel => {
+      sel.addEventListener('change', (e) => {
+        const idx = parseInt(e.target.dataset.idx, 10);
+        pulledDays[idx].attendanceStatus = e.target.value;
+        e.stopPropagation();
+      });
+      sel.addEventListener('click', (e) => e.stopPropagation());
+    });
+
+    const unmatchedEl = document.getElementById('attendance-unmatched');
+    if (pulledUnmatched.length) {
+      unmatchedEl.classList.remove('hidden');
+      unmatchedEl.innerHTML = 'PulseTime entries found for emails with no matching employee record: ' + pulledUnmatched.join(', ');
+    } else {
+      unmatchedEl.classList.add('hidden');
+    }
+  }
+
+  async function saveAttendanceSnapshot() {
+    if (!pulledDays || !pulledDays.length) return;
+    const periodId = document.getElementById('att-period-select').value;
+
+    const missingStatus = pulledDays.filter(r => r.isLeave && !r.attendanceStatus);
+    if (missingStatus.length) {
+      alert(`${missingStatus.length} leave day(s) still need an Attendance Status selected before saving.`);
+      return;
+    }
+
+    const btn = document.getElementById('save-attendance-btn');
+    btn.disabled = true;
+    btn.textContent = 'Saving…';
+    for (const r of pulledDays) {
+      await setDoc(doc(db, 'attendance', `${periodId}_${r.employeeId}_${r.date}`), {
+        period_id: periodId,
+        employee_id: r.employeeId,
+        date: r.date,
+        time_in: r.timeIn,
+        time_out: r.timeOut,
+        regular_hours: r.regularHours,
+        ot_hours: r.otHours,
+        late_minutes: r.lateMinutes,
+        undertime_minutes: r.undertimeMinutes,
+        night_minutes: r.nightMinutes || 0,
+        day_type: r.dayType || 'regular',
+        is_leave: r.isLeave,
+        attendance_status: r.attendanceStatus || null,
+        source: 'pulsetime',
+        pulled_at: serverTimestamp()
+      });
+    }
+    // Purge any unworked-weekend records a previous pull/save wrote before
+    // office days were restricted to Mon–Fri — harmless no-op if they were
+    // never saved in the first place.
+    for (const w of pulledWeekendClears) {
+      try { await deleteDoc(doc(db, 'attendance', `${periodId}_${w.employeeId}_${w.date}`)); } catch {}
+    }
+    btn.disabled = false;
+    btn.textContent = 'Save to payroll attendance';
+    alert('Attendance saved — ' + pulledDays.length + ' day records. Open this period in Payroll Processing to see it pre-filled.');
+  }
+
+  // ---------- Manual attendance entry (employees not on PulseTime) ----------
+  // Same underlying `attendance` collection/document shape as the PulseTime pull
+  // (doc id `${periodId}_${employeeId}_${date}`) so Payroll Processing pre-fills
+  // from either source transparently. Tagged source:'manual' to distinguish it
+  // in the attendance list here; entering a manual record for a date that was
+  // already pulled from PulseTime overwrites that day's record (last write wins),
+  // which is the intended way to hand-correct a specific day.
+  let manualAttEditingKey = null; // doc id currently being edited, or null for a new entry
+
+  function populateManualAttEmployeeSelect() {
+    const sel = document.getElementById('manual-att-employee');
+    if (!sel) return;
+    const current = sel.value;
+    const active = employeesCache.filter(e => e.status === 'active');
+    sel.innerHTML = active.map(e =>
+      `<option value="${e.id}">${e.name}${e.email ? '' : ' — no PulseTime email on file'}</option>`
+    ).join('') || '<option value="">No active employees yet</option>';
+    if (current && active.find(e => e.id === current)) sel.value = current;
+  }
+
+  // Mirrors the PulseTime pull's hours math: 1hr unpaid lunch auto-deducted on
+  // any span over 60 minutes, 8 worked hours = a full regular day, the rest is OT.
+  function computeManualHours(dateStr, timeInStr, timeOutStr) {
+    if (!timeInStr || !timeOutStr) return null;
+    // Explicit +08:00 anchor — the admin is entering a PH wall-clock time,
+    // not whatever timezone their own browser/OS happens to be set to.
+    const start = new Date(`${dateStr}T${timeInStr}:00+08:00`);
+    let end = new Date(`${dateStr}T${timeOutStr}:00+08:00`);
+    if (end <= start) end = new Date(end.getTime() + 24 * 60 * 60 * 1000); // overnight shift
+    const spanMinutes = (end - start) / 60000;
+    const lunchMinutes = spanMinutes > 60 ? 60 : 0;
+    const workedMinutes = Math.max(spanMinutes - lunchMinutes, 0);
+    const regularMinutes = Math.min(workedMinutes, 8 * 60);
+    const otMinutes = Math.max(workedMinutes - 8 * 60, 0);
+    const undertimeMinutes = Math.max(8 * 60 - workedMinutes, 0);
+    return {
+      timeInISO: start.toISOString(),
+      timeOutISO: end.toISOString(),
+      regularHours: Math.round((regularMinutes / 60) * 100) / 100,
+      otHours: Math.round((otMinutes / 60) * 100) / 100,
+      undertimeMinutes: Math.round(undertimeMinutes),
+      nightMinutes: window.__mpCalc.nightShiftMinutes(start, end),
+      workedMinutes
+    };
+  }
+
+  // Leave-type statuses don't need clock times; Present/Half Day are meant to
+  // be entered with actual time in/out, so toggle the inputs' requirement.
+  function updateManualAttTimeRequirement() {
+    const status = document.getElementById('manual-att-status').value;
+    const needsTimes = status === 'PRESENT' || status === '';
+    document.getElementById('manual-att-timein').required = needsTimes;
+    document.getElementById('manual-att-timeout').required = needsTimes;
+  }
+
+  async function saveManualAttendance(e) {
+    e.preventDefault();
+    const periodId = document.getElementById('att-period-select').value;
+    if (!periodId) { alert('Select a payroll period first (top of this page).'); return; }
+    const period = periodsCache.find(p => p.id === periodId);
+    if (!period) return;
+
+    const employeeId = document.getElementById('manual-att-employee').value;
+    const date = document.getElementById('manual-att-date').value;
+    const timeInStr = document.getElementById('manual-att-timein').value;
+    const timeOutStr = document.getElementById('manual-att-timeout').value;
+    let status = document.getElementById('manual-att-status').value;
+
+    if (!employeeId) { alert('Select an employee.'); return; }
+    if (!date) { alert('Select a date.'); return; }
+    if (date < period.cutoff_start || date > period.cutoff_end) {
+      alert(`That date is outside the selected period's cutoff (${period.cutoff_start} – ${period.cutoff_end}).`);
+      return;
+    }
+
+    const hasTimes = !!(timeInStr && timeOutStr);
+    if (!hasTimes && !status) {
+      alert('Either enter a time in/out, or choose an Attendance Status for a leave day.');
+      return;
+    }
+
+    const computed = computeManualHours(date, timeInStr, timeOutStr);
+    let isLeave, regularHours = 0, otHours = 0, undertimeMinutes = 0, timeInISO = null, timeOutISO = null, nightMinutes = 0;
+    let dayType = classifyDay(date);
+    const employee = employeesCache.find(e => e.id === employeeId);
+
+    if (computed) {
+      isLeave = false;
+      undertimeMinutes = computed.undertimeMinutes;
+      timeInISO = computed.timeInISO;
+      timeOutISO = computed.timeOutISO;
+      nightMinutes = computed.nightMinutes;
+      // Same plain-weekend rule as the PulseTime pull: a worked Sat/Sun with
+      // no holiday declared isn't rest-day-premium pay — Monthly folds fully
+      // into OT, Daily keeps a normal regular/OT split — either way dayType
+      // downgrades to 'regular' so no separate premium gets computed.
+      if (dayType === 'rest_day') {
+        dayType = 'regular';
+        if (employee && employee.rate_type === 'monthly') {
+          regularHours = 0;
+          otHours = Math.round((computed.workedMinutes / 60) * 100) / 100;
+        } else {
+          regularHours = computed.regularHours;
+          otHours = computed.otHours;
+        }
+      } else {
+        regularHours = computed.regularHours;
+        otHours = computed.otHours;
+      }
+      if (!status) status = (computed.workedMinutes >= 180 && computed.workedMinutes <= 300) ? 'HALF_DAY' : 'PRESENT';
+    } else {
+      isLeave = true;
+      // A leave status entered with no times — Half Day leave still zeroes hours here;
+      // admin can add a partial time in/out instead if they want it computed.
+    }
+
+    const docId = `${periodId}_${employeeId}_${date}`;
+    const btn = document.getElementById('manual-att-save-btn');
+    btn.disabled = true;
+    btn.textContent = 'Saving…';
+    try {
+      await setDoc(doc(db, 'attendance', docId), {
+        period_id: periodId,
+        employee_id: employeeId,
+        date,
+        time_in: timeInISO,
+        time_out: timeOutISO,
+        regular_hours: regularHours,
+        ot_hours: otHours,
+        late_minutes: 0,
+        undertime_minutes: undertimeMinutes,
+        night_minutes: nightMinutes,
+        day_type: dayType,
+        is_leave: isLeave,
+        attendance_status: status || null,
+        source: 'manual',
+        pulled_at: serverTimestamp()
+      });
+      alert(`Saved manual entry for ${employee ? employee.name : 'employee'} on ${date}.` + (manualAttEditingKey ? '' : ' Open this period in Payroll Processing to see it reflected.'));
+      exitManualAttEditMode();
+      document.getElementById('manual-att-form').reset();
+      updateManualAttTimeRequirement();
+      await loadManualEntries();
+    } catch (err) {
+      alert('Could not save manual entry: ' + err.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = manualAttEditingKey ? 'Save changes' : 'Add entry';
+    }
+  }
+
+  window.__mpEditManualEntry = (docId) => {
+    const row = manualEntriesCache.find(r => r.id === docId);
+    if (!row) return;
+    manualAttEditingKey = docId;
+    document.getElementById('manual-att-employee').value = row.employee_id;
+    document.getElementById('manual-att-date').value = row.date;
+    document.getElementById('manual-att-timein').value = row.time_in ? phTimeHHMM(new Date(row.time_in)) : '';
+    document.getElementById('manual-att-timeout').value = row.time_out ? phTimeHHMM(new Date(row.time_out)) : '';
+    document.getElementById('manual-att-status').value = row.attendance_status || '';
+    updateManualAttTimeRequirement();
+    document.getElementById('manual-att-form-title').textContent = 'Edit manual entry';
+    document.getElementById('manual-att-save-btn').textContent = 'Save changes';
+    document.getElementById('manual-att-cancel-btn').classList.remove('hidden');
+    document.getElementById('manual-att-form').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
+  window.__mpDeleteManualEntry = async (docId) => {
+    if (!confirm('Delete this manual attendance entry?')) return;
+    await deleteDoc(doc(db, 'attendance', docId));
+    await loadManualEntries();
+  };
+
+  function exitManualAttEditMode() {
+    manualAttEditingKey = null;
+    document.getElementById('manual-att-form-title').textContent = 'Manual time entry';
+    document.getElementById('manual-att-save-btn').textContent = 'Add entry';
+    document.getElementById('manual-att-cancel-btn').classList.add('hidden');
+    document.getElementById('manual-att-form').reset();
+    updateManualAttTimeRequirement();
+  }
+
+  // ---------- Cash Advance ----------
+  // One active cash advance per employee at a time, deducted in equal
+  // installments (amount ÷ terms) automatically pre-filled into Payroll
+  // Processing each cutoff. balance_remaining and terms_paid track progress;
+  // cash_advance_deductions logs exactly which period deducted how much,
+  // both for audit and so "Send back to draft" can cleanly reverse it.
+  let cashAdvancesCache = [];
+
+  async function loadCashAdvances() {
+    const tbody = document.getElementById('cashadvance-tbody');
+    if (!tbody) return;
+    const q = query(collection(db, 'cash_advances'), orderBy('date_granted', 'desc'));
+    const snap = await getDocs(q);
+    cashAdvancesCache = [];
+    snap.forEach(d => cashAdvancesCache.push({ id: d.id, ...d.data() }));
+
+    const f = (n) => '₱' + (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+    tbody.innerHTML = cashAdvancesCache.map(ca => {
+      const emp = employeesCache.find(e => e.id === ca.employee_id);
+      return `
+        <tr>
+          <td>${emp ? emp.name : ca.employee_id}</td>
+          <td class="num">${f(ca.amount)}</td>
+          <td class="num">${ca.terms}</td>
+          <td class="num">${f(ca.installment_amount)}</td>
+          <td class="num">${f(ca.balance_remaining)}</td>
+          <td>${ca.terms_paid || 0} / ${ca.terms}</td>
+          <td><span class="status status-${ca.status === 'active' ? 'active' : 'inactive'}">${ca.status}</span></td>
+          <td>${ca.date_granted || '—'}</td>
+          <td>${ca.status === 'active' && !(ca.terms_paid > 0) ? `<button class="btn-icon" style="color:var(--red);" onclick="__mpCancelCashAdvance('${ca.id}')">Cancel</button>` : ''}</td>
+        </tr>`;
+    }).join('') || `<tr><td colspan="9" class="empty">No cash advances yet.</td></tr>`;
+  }
+
+  async function createCashAdvance(e) {
+    e.preventDefault();
+    const employeeId = document.getElementById('ca-employee').value;
+    const amount = parseFloat(document.getElementById('ca-amount').value || 0);
+    const terms = parseInt(document.getElementById('ca-terms').value || 1, 10);
+    const dateGranted = document.getElementById('ca-date').value;
+    const notes = document.getElementById('ca-notes').value.trim();
+    if (!employeeId || amount <= 0 || terms <= 0) return;
+
+    // One active advance per employee at a time — keeps the per-cutoff
+    // installment lookup and the balance ledger unambiguous.
+    const existing = cashAdvancesCache.find(ca => ca.employee_id === employeeId && ca.status === 'active');
+    if (existing) {
+      alert('This employee already has an active cash advance. It must be fully paid or cancelled before granting a new one.');
+      return;
+    }
+
+    const installment = Math.round((amount / terms) * 100) / 100;
+    await addDoc(collection(db, 'cash_advances'), {
+      employee_id: employeeId, amount, terms, installment_amount: installment,
+      balance_remaining: amount, terms_paid: 0, status: 'active',
+      date_granted: dateGranted || new Date().toISOString().slice(0, 10),
+      notes, created_at: serverTimestamp()
+    });
+    e.target.reset();
+    loadCashAdvances();
+  }
+
+  window.__mpCancelCashAdvance = async (id) => {
+    if (!confirm('Cancel this cash advance? Only allowed before any installment has been deducted.')) return;
+    await updateDoc(doc(db, 'cash_advances', id), { status: 'cancelled' });
+    loadCashAdvances();
+  };
+
+  // Returns { id, amountDue } for the employee's one active advance, or null.
+  function getCashAdvanceDueForEmployee(employeeId) {
+    const ca = cashAdvancesCache.find(c => c.employee_id === employeeId && c.status === 'active');
+    if (!ca) return null;
+    const amountDue = Math.min(ca.installment_amount, ca.balance_remaining);
+    return amountDue > 0 ? { id: ca.id, amountDue: Math.round(amountDue * 100) / 100 } : null;
+  }
+
+  // Called from saveBatch: applies whatever cash advance amount each row
+  // actually saved with against that employee's active advance ledger.
+  // Idempotent: saveBatch can run more than once for the same period before
+  // approval (reprocess → resave), so this adjusts by the DELTA against
+  // whatever this period previously logged, rather than re-applying the
+  // full amount each time.
+  async function applyCashAdvanceDeductions(periodId, deductionsByEmployee) {
+    for (const [employeeId, amount] of Object.entries(deductionsByEmployee)) {
+      const newAmount = Math.round((amount || 0) * 100) / 100;
+
+      // Find any existing log for THIS period+employee first (identifies
+      // which specific advance this period is already tied to, if any) —
+      // avoids ambiguity from an employee having older, completed advances.
+      const existingLogQuery = query(collection(db, 'cash_advance_deductions'),
+        where('period_id', '==', periodId), where('employee_id', '==', employeeId));
+      const existingLogSnap = await getDocs(existingLogQuery);
+      const existingLogDoc = existingLogSnap.docs[0];
+
+      const ca = existingLogDoc
+        ? cashAdvancesCache.find(c => c.id === existingLogDoc.data().cash_advance_id)
+        : cashAdvancesCache.find(c => c.employee_id === employeeId && c.status === 'active');
+      if (!ca) continue;
+
+      const previousAmount = existingLogDoc ? (existingLogDoc.data().amount_deducted || 0) : 0;
+      const delta = newAmount - previousAmount;
+      if (delta === 0) continue;
+
+      // Cap so balance_remaining never goes negative (e.g. admin typed more than what's actually left owing).
+      const safeDelta = Math.min(delta, ca.balance_remaining);
+      const newBalance = Math.round((ca.balance_remaining - safeDelta) * 100) / 100;
+      const logRef = doc(db, 'cash_advance_deductions', `${periodId}_${ca.id}`);
+
+      if (newAmount > 0) {
+        await setDoc(logRef, {
+          period_id: periodId, cash_advance_id: ca.id, employee_id: employeeId,
+          amount_deducted: previousAmount + safeDelta, deducted_at: serverTimestamp()
+        });
+      } else if (existingLogDoc) {
+        await deleteDoc(doc(db, 'cash_advance_deductions', existingLogDoc.id));
+      }
+
+      const wasNewLog = !existingLogDoc && newAmount > 0;
+      const wasRemovedLog = !!existingLogDoc && newAmount <= 0;
+      const newTermsPaid = wasNewLog ? (ca.terms_paid || 0) + 1
+        : wasRemovedLog ? Math.max((ca.terms_paid || 0) - 1, 0)
+        : (ca.terms_paid || 0);
+
+      await updateDoc(doc(db, 'cash_advances', ca.id), {
+        balance_remaining: newBalance,
+        terms_paid: newTermsPaid,
+        status: newBalance <= 0 && newAmount > 0 ? 'completed' : 'active'
+      });
+      ca.balance_remaining = newBalance; // keep local cache consistent within this loop
+      ca.terms_paid = newTermsPaid;
+    }
+    await loadCashAdvances();
+  }
+
+  // Called from sendPeriodBackToDraft: undoes whatever this period deducted,
+  // so reprocessing doesn't double-charge the employee.
+  async function reverseCashAdvanceDeductions(periodId) {
+    const q = query(collection(db, 'cash_advance_deductions'), where('period_id', '==', periodId));
+    const snap = await getDocs(q);
+    for (const docSnap of snap.docs) {
+      const log = docSnap.data();
+      const caSnap = await getDoc(doc(db, 'cash_advances', log.cash_advance_id));
+      if (caSnap.exists()) {
+        const ca = caSnap.data();
+        await updateDoc(doc(db, 'cash_advances', log.cash_advance_id), {
+          balance_remaining: Math.round((ca.balance_remaining + log.amount_deducted) * 100) / 100,
+          terms_paid: Math.max((ca.terms_paid || 0) - 1, 0),
+          status: 'active'
+        });
+      }
+      await deleteDoc(doc(db, 'cash_advance_deductions', docSnap.id));
+    }
+    await loadCashAdvances();
+  }
+
+  let manualEntriesCache = [];
+
+  // Builds the OT / Undertime / ND at-a-glance tags for one attendance record,
+  // so what pay applies to a given day is visible without opening Processing.
+  function buildPayFlagsHtml(r) {
+    const flags = [];
+    if ((r.ot_hours || 0) > 0) flags.push(`<span class="tag tag-ot">OT ${r.ot_hours}h</span>`);
+    if ((r.undertime_minutes || 0) > 0) flags.push(`<span class="tag tag-undertime">Undertime ${Math.round(r.undertime_minutes)}min</span>`);
+    if ((r.night_minutes || 0) > 0) flags.push(`<span class="tag tag-nd">ND ${Math.round(r.night_minutes / 60 * 10) / 10}h</span>`);
+    return flags.join(' ');
+  }
+
+  async function loadManualEntries() {
+    const periodId = document.getElementById('att-period-select').value;
+    const tbody = document.getElementById('manual-att-tbody');
+    if (!tbody) return;
+    if (!periodId) { manualEntriesCache = []; tbody.innerHTML = `<tr><td colspan="7" class="empty">Select a payroll period above.</td></tr>`; return; }
+
+    const q = query(collection(db, 'attendance'), where('period_id', '==', periodId), where('source', '==', 'manual'));
+    const snap = await getDocs(q);
+    manualEntriesCache = [];
+    snap.forEach(d => manualEntriesCache.push({ id: d.id, ...d.data() }));
+    manualEntriesCache.sort((a, b) => a.date.localeCompare(b.date) || (a.employee_id || '').localeCompare(b.employee_id || ''));
+
+    const fmtTime = (iso) => iso ? new Date(iso).toLocaleTimeString('en-PH', { timeZone: 'Asia/Manila', hour: '2-digit', minute: '2-digit' }) : '—';
+    const statusLabel = (v) => (ATTENDANCE_STATUSES.find(s => s.value === v) || {}).label || '—';
+
+    tbody.innerHTML = manualEntriesCache.map(r => {
+      const emp = employeesCache.find(e => e.id === r.employee_id);
+      const flagsHtml = buildPayFlagsHtml(r);
+      return `
+        <tr>
+          <td>${emp ? emp.name : r.employee_id}</td>
+          <td style="color:var(--muted);">${r.date}</td>
+          <td>${fmtTime(r.time_in)}</td>
+          <td>${fmtTime(r.time_out)}</td>
+          <td>${statusLabel(r.attendance_status)}${r.is_leave ? ' <span class="tag" style="border-color:var(--red); color:var(--red);">Leave</span>' : ''}</td>
+          <td>${flagsHtml || '<span style="color:var(--muted); font-size:11px;">—</span>'}</td>
+          <td>
+            <button class="btn-icon" style="color:var(--navy);" onclick='__mpEditManualEntry("${r.id}")'>Edit</button>
+            <button class="btn-icon" style="margin-left:10px;" onclick='__mpDeleteManualEntry("${r.id}")'>Delete</button>
+          </td>
+        </tr>`;
+    }).join('') || `<tr><td colspan="7" class="empty">No manual entries for this period yet.</td></tr>`;
+  }
+
+  // Aggregates the saved daily records for one employee/period into the
+  // summary shape Payroll Processing pre-fills from (days present, OT, etc).
+  async function getAttendanceSnapshot(periodId, employeeId) {
+    try {
+      const q = query(collection(db, 'attendance'),
+        where('period_id', '==', periodId), where('employee_id', '==', employeeId));
+      const snap = await getDocs(q);
+      const days = [];
+      snap.forEach(d => days.push(d.data()));
+      if (!days.length) return null;
+
+      // daysPresent: used directly as "Payable Days" for daily-rate employees.
+      // unpaidDays: any day that isn't fully paid — a worked-but-short day (Half Day),
+      // an official Unpaid/Emergency Leave day, or a Half Day leave. All treated the
+      // same way for pay purposes: they reduce the paid days for the period.
+      let daysPresent = 0, paidLeaveDays = 0, unpaidDays = 0;
+      let totalHours = 0, otHours = 0, undertimeMinutes = 0;
+      days.forEach(d => {
+        if (!d.is_leave) {
+          if (d.attendance_status === 'HALF_DAY') {
+            daysPresent += 0.5;
+            unpaidDays += 0.5; // present, but only worked half — counts as an unpaid half day
+          } else {
+            daysPresent += 1;
+          }
+          totalHours += d.regular_hours || 0;
+          undertimeMinutes += d.undertime_minutes || 0;
+        } else if (d.attendance_status === 'PAID_LEAVE') {
+          daysPresent += 1; // only Paid Leave counts as a paid day, per confirmed rule
+          paidLeaveDays += 1;
+        } else if (d.attendance_status === 'HALF_DAY') {
+          unpaidDays += 0.5; // took half a day of (unpaid) leave
+        } else {
+          unpaidDays += 1; // Unpaid Leave or Emergency Leave — full unpaid day
+        }
+        otHours += d.ot_hours || 0;
+      });
+      return {
+        days_present: daysPresent,
+        paid_leave_days: paidLeaveDays,
+        unpaid_days: Math.round(unpaidDays * 100) / 100,
+        total_hours: Math.round(totalHours * 100) / 100,
+        ot_hours: Math.round(otHours * 100) / 100,
+        undertime_minutes: undertimeMinutes,
+        days, // raw day records — used by computeSpecialDayPay/otMultiplierForDays for DOLE premium computation
+        source: 'pulsetime'
+      };
+    } catch { return null; }
+  }
+
+  function populateAttendancePeriodSelect() {
+    const sel = document.getElementById('att-period-select');
+    if (!sel) return;
+    const current = sel.value;
+    sel.innerHTML = periodsCache.map(p => `<option value="${p.id}">${p.cutoff_start} – ${p.cutoff_end}</option>`).join('') || '<option value="">No periods yet</option>';
+    if (current && periodsCache.find(p => p.id === current)) sel.value = current;
+    loadManualEntries();
+  }
+
 
   async function createPeriod(e) {
     e.preventDefault();
@@ -304,9 +1788,11 @@
   function loadPeriods() {
     const q = query(collection(db, 'payroll_periods'), orderBy('cutoff_start', 'desc'));
     onSnapshot(q, (snap) => {
+      periodsCache = [];
       const rows = [];
       snap.forEach(docSnap => {
         const d = docSnap.data();
+        periodsCache.push({ id: docSnap.id, ...d });
         rows.push(`
           <tr>
             <td>${d.cutoff_start} &ndash; ${d.cutoff_end}</td>
@@ -317,6 +1803,10 @@
           </tr>`);
       });
       document.getElementById('periods-tbody').innerHTML = rows.join('') || `<tr><td colspan="5" class="empty">No payroll periods yet. Create one above.</td></tr>`;
+      populateAttendancePeriodSelect();
+      renderApprovalList();
+      populatePayslipPeriodSelect();
+      populateReportPeriodSelect();
     });
   }
 
@@ -326,63 +1816,584 @@
     renderProcessingTable();
   };
 
-  function renderProcessingTable() {
-    const periodType = document.getElementById('period-type-active').dataset.type || 'semi-monthly';
-    const factor = periodType === 'monthly' ? 1 : 0.5;
-    const rows = employeesCache.filter(e => e.status === 'active').map(emp => {
+  async function renderProcessingTable() {
+    const period = periodsCache.find(p => p.id === currentPeriodId);
+    const activeEmployees = employeesCache.filter(e => e.status === 'active');
+
+    const snapshots = {};
+    await Promise.all(activeEmployees.map(async (emp) => {
+      snapshots[emp.id] = await getAttendanceSnapshot(currentPeriodId, emp.id);
+    }));
+
+    // Show the real period type and the current cutoff's statutory position, so
+    // it's obvious why SSS/PhilHealth/Pag-IBIG/Tax might read ₱0 this cutoff.
+    const typeLabel = document.getElementById('period-type-label');
+    const cutoffBadge = document.getElementById('cutoff-position-badge');
+    if (period) {
+      if (typeLabel) typeLabel.textContent = period.period_type === 'monthly' ? 'Monthly cutoff (single cutoff covers the whole month)' : 'Semi-monthly cutoff';
+      if (cutoffBadge) {
+        const position = window.__mpCalc.determineCutoffPosition(period);
+        const label = position === 'first' ? 'First cutoff — all statutory deductions (SSS/PhilHealth/Pag-IBIG/Tax): ₱0'
+          : position === 'second' ? 'Second cutoff — full month\'s statutory deductions applied here'
+          : 'Monthly cutoff — full statutory deduction';
+        cutoffBadge.textContent = label;
+      }
+    }
+
+    const monthlyRows = activeEmployees.filter(e => e.rate_type === 'monthly').map(emp => {
+      const snap = snapshots[emp.id];
+      const unpaidDays = snap ? snap.unpaid_days : 0;
+      const ot = snap ? snap.ot_hours : 0;
+      const premium = snap ? window.__mpCalc.computeSpecialDayPay(snap.days, emp) : { holidayPay: 0, restDayPay: 0, nsdPay: 0 };
+      const otMultiplier = snap ? window.__mpCalc.otMultiplierForDays(snap.days, emp) : 1.25;
+      const caDue = getCashAdvanceDueForEmployee(emp.id);
       return `
-        <tr data-emp-id="${emp.id}">
-          <td>${emp.name}<div style="font-size:11px;color:var(--muted);">${emp.rate_type === 'daily' ? '₱' + emp.rate_amount + '/day' : '₱' + emp.rate_amount + '/mo'}</div></td>
-          <td><input type="number" class="cell-input" data-field="days" value="13" min="0" step="0.5" style="width:60px;"></td>
-          <td><input type="number" class="cell-input" data-field="ot" value="0" min="0" step="0.5" style="width:60px;"></td>
-          <td><input type="number" class="cell-input" data-field="allowances" value="0" min="0" step="0.01" style="width:70px;"></td>
+        <tr data-emp-id="${emp.id}" data-rate-type="monthly" data-ot-multiplier="${otMultiplier}">
+          <td>${emp.name}<div style="font-size:11px;color:var(--muted);">₱${emp.rate_amount}/mo${snap ? ' · from attendance records' : ''}</div></td>
+          <td><input type="number" class="cell-input" data-field="unpaidDays" value="${unpaidDays}" min="0" step="0.5" style="width:56px;"></td>
+          <td><input type="number" class="cell-input" data-field="otHours" value="${ot}" min="0" step="0.5" style="width:56px;"></td>
+          <td><input type="number" class="cell-input" data-field="holidayPay" value="${premium.holidayPay}" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="restDayPay" value="${premium.restDayPay}" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="nsdPay" value="${premium.nsdPay}" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="otherEarnings" value="0" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="cashAdvanceDeduction" value="${caDue ? caDue.amountDue : 0}" min="0" step="0.01" style="width:75px;" title="${caDue ? 'Installment against active cash advance' : 'No active cash advance'}"></td>
           <td class="num result-gross">—</td>
           <td class="num result-deductions">—</td>
           <td class="num result-net">—</td>
         </tr>`;
     }).join('');
-    document.getElementById('processing-tbody').innerHTML = rows || `<tr><td colspan="7" class="empty">No active employees. Add employees first.</td></tr>`;
-    document.querySelectorAll('#processing-tbody .cell-input').forEach(inp => inp.addEventListener('input', () => recomputeRow(inp.closest('tr'), factor)));
-    document.querySelectorAll('#processing-tbody tr[data-emp-id]').forEach(tr => recomputeRow(tr, factor));
+
+    const dailyRows = activeEmployees.filter(e => e.rate_type === 'daily').map(emp => {
+      const snap = snapshots[emp.id];
+      const days = snap ? snap.days_present : 13;
+      const ot = snap ? snap.ot_hours : 0;
+      const premium = snap ? window.__mpCalc.computeSpecialDayPay(snap.days, emp) : { holidayPay: 0, restDayPay: 0, nsdPay: 0 };
+      const otMultiplier = snap ? window.__mpCalc.otMultiplierForDays(snap.days, emp) : 1.25;
+      const caDue = getCashAdvanceDueForEmployee(emp.id);
+      return `
+        <tr data-emp-id="${emp.id}" data-rate-type="daily" data-ot-multiplier="${otMultiplier}">
+          <td>${emp.name}<div style="font-size:11px;color:var(--muted);">₱${emp.rate_amount}/day${snap ? ' · from attendance records' : ''}</div></td>
+          <td><input type="number" class="cell-input" data-field="payableDays" value="${days}" min="0" step="0.5" style="width:56px;"></td>
+          <td><input type="number" class="cell-input" data-field="otHours" value="${ot}" min="0" step="0.5" style="width:56px;"></td>
+          <td><input type="number" class="cell-input" data-field="holidayPay" value="${premium.holidayPay}" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="restDayPay" value="${premium.restDayPay}" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="nsdPay" value="${premium.nsdPay}" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="otherEarnings" value="0" min="0" step="0.01" style="width:70px;"></td>
+          <td><input type="number" class="cell-input" data-field="cashAdvanceDeduction" value="${caDue ? caDue.amountDue : 0}" min="0" step="0.01" style="width:75px;" title="${caDue ? 'Installment against active cash advance' : 'No active cash advance'}"></td>
+          <td class="num result-gross">—</td>
+          <td class="num result-deductions">—</td>
+          <td class="num result-net">—</td>
+        </tr>`;
+    }).join('');
+
+    document.getElementById('processing-tbody-monthly').innerHTML = monthlyRows || `<tr><td colspan="11" class="empty">No active monthly-rate employees.</td></tr>`;
+    document.getElementById('processing-tbody-daily').innerHTML = dailyRows || `<tr><td colspan="11" class="empty">No active daily-rate employees.</td></tr>`;
+
+    document.querySelectorAll('#processing-tbody-monthly .cell-input, #processing-tbody-daily .cell-input')
+      .forEach(inp => inp.addEventListener('input', () => recomputeRow(inp.closest('tr'), period)));
+    document.querySelectorAll('#processing-tbody-monthly tr[data-emp-id], #processing-tbody-daily tr[data-emp-id]')
+      .forEach(tr => recomputeRow(tr, period));
   }
 
-  function recomputeRow(tr, factor) {
+  function recomputeRow(tr, period) {
     const empId = tr.dataset.empId;
     const emp = employeesCache.find(e => e.id === empId);
-    if (!emp) return;
-    const days = parseFloat(tr.querySelector('[data-field="days"]').value || 0);
-    const ot = parseFloat(tr.querySelector('[data-field="ot"]').value || 0);
-    const allowances = parseFloat(tr.querySelector('[data-field="allowances"]').value || 0);
-    const rec = window.__mpCalc.computeRecord(emp, { daysPresent: days, otHours: ot, allowances }, factor);
+    if (!emp || !period) return;
+    const val = (field) => parseFloat(tr.querySelector(`[data-field="${field}"]`)?.value || 0);
+    const otMultiplier = parseFloat(tr.dataset.otMultiplier) || 1.25;
+
+    const inputs = emp.rate_type === 'monthly'
+      ? {
+          unpaidDays: val('unpaidDays'), otHours: val('otHours'), otMultiplier,
+          holidayPay: val('holidayPay'), restDayPay: val('restDayPay'), nsdPay: val('nsdPay'),
+          otherEarnings: val('otherEarnings'), cashAdvanceDeduction: val('cashAdvanceDeduction')
+        }
+      : {
+          payableDays: val('payableDays'), otHours: val('otHours'), otMultiplier,
+          holidayPay: val('holidayPay'), restDayPay: val('restDayPay'), nsdPay: val('nsdPay'),
+          otherEarnings: val('otherEarnings'), cashAdvanceDeduction: val('cashAdvanceDeduction')
+        };
+
+    const rec = window.__mpCalc.computeRecord(emp, inputs, period);
     tr.querySelector('.result-gross').textContent = '₱' + rec.gross.toLocaleString('en-PH', {minimumFractionDigits: 2});
     tr.querySelector('.result-deductions').textContent = '₱' + rec.totalDeductions.toLocaleString('en-PH', {minimumFractionDigits: 2});
-    tr.querySelector('.result-net').textContent = '₱' + rec.net.toLocaleString('en-PH', {minimumFractionDigits: 2});
+    const netCell = tr.querySelector('.result-net');
+    netCell.textContent = '₱' + rec.net.toLocaleString('en-PH', {minimumFractionDigits: 2});
+    if (rec.needsReview) {
+      netCell.innerHTML += ` <span class="tag" style="border-color:var(--red); color:var(--red);" title="Deductions exceeded pay before flooring — raw gross ₱${rec.grossRaw.toFixed(2)}, raw net ₱${rec.netRaw.toFixed(2)}. Check attendance data for this employee.">⚠ Review</span>`;
+    }
     tr.dataset.record = JSON.stringify(rec);
+  }
+
+  // ---------- Payroll sheet preview / print / email ----------
+  function buildPayrollSheetHtml() {
+    const period = periodsCache.find(p => p.id === currentPeriodId);
+    const rows = document.querySelectorAll('#processing-tbody-monthly tr[data-emp-id], #processing-tbody-daily tr[data-emp-id]');
+    if (!period || !rows.length) return null;
+
+    const logoImg = document.querySelector('.login-logo');
+    const logoSrc = logoImg ? logoImg.src : '';
+
+    let totals = { gross: 0, sss: 0, philhealth: 0, pagibig: 0, tax: 0, deductions: 0, net: 0 };
+    const lineRows = Array.from(rows).map(tr => {
+      const empId = tr.dataset.empId;
+      const emp = employeesCache.find(e => e.id === empId);
+      const rec = JSON.parse(tr.dataset.record || '{}');
+      totals.gross += rec.gross || 0;
+      totals.sss += rec.sss || 0;
+      totals.philhealth += rec.philhealth || 0;
+      totals.pagibig += rec.pagibig || 0;
+      totals.tax += rec.tax || 0;
+      totals.deductions += rec.totalDeductions || 0;
+      totals.net += rec.net || 0;
+      const f = (n) => (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+      return `
+        <tr>
+          <td>${emp ? emp.name : '—'}</td>
+          <td>${f(rec.gross)}</td>
+          <td>${f(rec.sss)}</td>
+          <td>${f(rec.philhealth)}</td>
+          <td>${f(rec.pagibig)}</td>
+          <td>${f(rec.tax)}</td>
+          <td>${f(rec.totalDeductions)}</td>
+          <td>${f(rec.net)}</td>
+        </tr>`;
+    }).join('');
+    const f = (n) => (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+
+    return {
+      totals,
+      employeeCount: rows.length,
+      html: `
+        <div class="sheet-header">
+          ${logoSrc ? `<img src="${logoSrc}" alt="Mechatrade">` : '<div></div>'}
+          <div class="sheet-title">
+            <h2>Payroll Register</h2>
+            <div>Generated ${new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila' })}</div>
+          </div>
+        </div>
+        <div class="sheet-meta">
+          <div><span>Cutoff period</span>${period.cutoff_start} – ${period.cutoff_end}</div>
+          <div><span>Pay date</span>${period.pay_date || '—'}</div>
+          <div><span>Period type</span>${period.period_type}</div>
+        </div>
+        <table class="sheet-table">
+          <thead>
+            <tr>
+              <th>Employee</th><th>Gross</th><th>SSS</th><th>PhilHealth</th><th>Pag-IBIG</th><th>Tax</th><th>Total ded.</th><th>Net pay</th>
+            </tr>
+          </thead>
+          <tbody>${lineRows}</tbody>
+          <tfoot>
+            <tr>
+              <td>Totals (${rows.length} employees)</td>
+              <td>${f(totals.gross)}</td>
+              <td>${f(totals.sss)}</td>
+              <td>${f(totals.philhealth)}</td>
+              <td>${f(totals.pagibig)}</td>
+              <td>${f(totals.tax)}</td>
+              <td>${f(totals.deductions)}</td>
+              <td>${f(totals.net)}</td>
+            </tr>
+          </tfoot>
+        </table>
+        <div class="sheet-footer">
+          <div>Mechatrade Industrial Solutions Inc. — Payroll &amp; statutory system</div>
+          <div>Control number: ${currentPeriodId}</div>
+        </div>`
+    };
+  }
+
+  // Builds the same style of register as buildPayrollSheetHtml, but from saved
+  // Firestore records rather than the live Processing table — used by
+  // Approval, Payslips, and Reports, which may view a period that isn't
+  // currently open in Processing.
+  async function buildRegisterFromRecords(periodId) {
+    const period = periodsCache.find(p => p.id === periodId);
+    if (!period) return null;
+    const records = await fetchRecordsForPeriod(periodId);
+    if (!records.length) return null;
+
+    const logoImg = document.querySelector('.login-logo');
+    const logoSrc = logoImg ? logoImg.src : '';
+    const f = (n) => (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+
+    let totals = { gross: 0, sss: 0, philhealth: 0, pagibig: 0, tax: 0, deductions: 0, net: 0, sssEmployer: 0, sssEC: 0, philhealthEmployer: 0, pagibigEmployer: 0 };
+    const lineRows = records.map(rec => {
+      const emp = employeesCache.find(e => e.id === rec.employee_id);
+      totals.gross += rec.gross || 0;
+      totals.sss += rec.sss || 0;
+      totals.philhealth += rec.philhealth || 0;
+      totals.pagibig += rec.pagibig || 0;
+      totals.tax += rec.tax || 0;
+      totals.deductions += rec.totalDeductions || 0;
+      totals.net += rec.net || 0;
+      totals.sssEmployer += rec.sssEmployer || 0;
+      totals.sssEC += rec.sssEC || 0;
+      totals.philhealthEmployer += rec.philhealthEmployer || 0;
+      totals.pagibigEmployer += rec.pagibigEmployer || 0;
+      return `
+        <tr>
+          <td>${emp ? emp.name : rec.employee_id}${rec.needsReview ? ' <span style="color:var(--red); font-size:11px;" title="Deductions exceeded pay before flooring — check attendance data">⚠</span>' : ''}</td>
+          <td>${f(rec.gross)}</td><td>${f(rec.sss)}</td><td>${f(rec.philhealth)}</td>
+          <td>${f(rec.pagibig)}</td><td>${f(rec.tax)}</td><td>${f(rec.totalDeductions)}</td><td>${f(rec.net)}</td>
+        </tr>`;
+    }).join('');
+
+    return {
+      totals,
+      employeeCount: records.length,
+      html: `
+        <div class="sheet-header">
+          ${logoSrc ? `<img src="${logoSrc}" alt="Mechatrade">` : '<div></div>'}
+          <div class="sheet-title"><h2>Payroll Register</h2><div>Generated ${new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila' })}</div></div>
+        </div>
+        <div class="sheet-meta">
+          <div><span>Cutoff period</span>${period.cutoff_start} – ${period.cutoff_end}</div>
+          <div><span>Pay date</span>${period.pay_date || '—'}</div>
+          <div><span>Status</span>${period.status}</div>
+        </div>
+        <table class="sheet-table">
+          <thead><tr><th>Employee</th><th>Gross</th><th>SSS</th><th>PhilHealth</th><th>Pag-IBIG</th><th>Tax</th><th>Total ded.</th><th>Net pay</th></tr></thead>
+          <tbody>${lineRows}</tbody>
+          <tfoot><tr>
+            <td>Totals (${records.length} employees)</td>
+            <td>${f(totals.gross)}</td><td>${f(totals.sss)}</td><td>${f(totals.philhealth)}</td>
+            <td>${f(totals.pagibig)}</td><td>${f(totals.tax)}</td><td>${f(totals.deductions)}</td><td>${f(totals.net)}</td>
+          </tr></tfoot>
+        </table>
+        <div class="sheet-footer">
+          <div>Mechatrade Industrial Solutions Inc. — Payroll &amp; statutory system</div>
+          <div>Control number: ${periodId}</div>
+        </div>`
+    };
+  }
+
+  async function buildIndividualPayslipHtml(periodId, employeeId) {
+    const period = periodsCache.find(p => p.id === periodId);
+    const emp = employeesCache.find(e => e.id === employeeId);
+    if (!period || !emp) return null;
+    const records = await fetchRecordsForPeriod(periodId);
+    const rec = records.find(r => r.employee_id === employeeId);
+    if (!rec) return null;
+
+    const logoImg = document.querySelector('.login-logo');
+    const logoSrc = logoImg ? logoImg.src : '';
+    const f = (n) => (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+
+    const line = (label, value, negative) => `
+      <tr><td>${label}</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace;">${negative ? '−' : ''}₱${f(value)}</td></tr>`;
+
+    const earningsRows = emp.rate_type === 'monthly'
+      ? [
+          line('Semi-monthly base (Monthly ÷ 2)', rec.basic),
+          line('Overtime pay', rec.ot),
+          line('Holiday pay', rec.holidayPay),
+          line('Rest day pay', rec.restDayPay),
+          line('Night shift differential', rec.nsdPay),
+          line('Other earnings', rec.otherEarnings)
+        ].join('')
+      : [
+          line('Basic pay (Daily rate × Payable days)', rec.basic),
+          line('Overtime pay', rec.ot),
+          line('Holiday pay', rec.holidayPay),
+          line('Rest day pay', rec.restDayPay),
+          line('Night shift differential', rec.nsdPay),
+          line('Other earnings', rec.otherEarnings)
+        ].join('');
+
+    const unpaidRow = (emp.rate_type === 'monthly' && rec.unpaidDeduction)
+      ? line('Unpaid days deduction', rec.unpaidDeduction, true)
+      : '';
+
+    return `
+      <div class="sheet-header">
+        ${logoSrc ? `<img src="${logoSrc}" alt="Mechatrade">` : '<div></div>'}
+        <div class="sheet-title"><h2>Payslip</h2><div>Generated ${new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila' })}</div></div>
+      </div>
+      <div class="sheet-meta">
+        <div><span>Employee</span>${emp.name}</div>
+        <div><span>Position</span>${emp.position || '—'}</div>
+        <div><span>Rate type</span>${emp.rate_type}</div>
+        <div><span>Cutoff period</span>${period.cutoff_start} – ${period.cutoff_end}</div>
+        <div><span>Pay date</span>${period.pay_date || '—'}</div>
+        <div><span>Status</span>${rec.status}</div>
+      </div>
+      <table class="sheet-table" style="max-width:420px;">
+        <thead><tr><th colspan="2" style="text-align:left;">Earnings</th></tr></thead>
+        <tbody>
+          ${earningsRows}
+          ${unpaidRow}
+        </tbody>
+        <tfoot><tr><td>Gross pay</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace;">₱${f(rec.gross)}</td></tr></tfoot>
+      </table>
+      <table class="sheet-table" style="max-width:420px; margin-top:18px;">
+        <thead><tr><th colspan="2" style="text-align:left;">Deductions${rec.cutoffPosition === 'first' ? ' (first cutoff — no SSS/PhilHealth/Pag-IBIG)' : ''}</th></tr></thead>
+        <tbody>
+          ${line('SSS', rec.sss, true)}
+          ${line('PhilHealth', rec.philhealth, true)}
+          ${line('Pag-IBIG', rec.pagibig, true)}
+          ${line('Withholding tax', rec.tax, true)}
+          ${rec.cashAdvanceDeduction ? line('Cash advance', rec.cashAdvanceDeduction, true) : ''}
+          ${line('Other deductions', rec.otherDeductions, true)}
+        </tbody>
+        <tfoot><tr><td>Total deductions</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace;">−₱${f(rec.totalDeductions)}</td></tr></tfoot>
+      </table>
+      <table class="sheet-table" style="max-width:420px; margin-top:18px;">
+        <tbody><tr style="font-weight:600;"><td>Net pay</td><td style="text-align:right; font-family:'IBM Plex Mono',monospace; font-size:14px;">₱${f(rec.net)}</td></tr></tbody>
+      </table>
+      ${rec.needsReview ? `<div style="margin-top:10px; font-size:11.5px; color:var(--red); border-left:2px solid var(--red); padding-left:10px;">⚠ Deductions exceeded pay before flooring to ₱0 — raw gross ₱${f(rec.grossRaw)}, raw net ₱${f(rec.netRaw)}. Check this employee's attendance data before releasing.</div>` : ''}
+      <div class="sheet-footer" style="margin-top:24px;">
+        <div>Mechatrade Industrial Solutions Inc. — Payroll &amp; statutory system</div>
+        <div>Control number: ${periodId}</div>
+      </div>`;
+  }
+
+  function openPayrollPreview() {
+    const built = buildPayrollSheetHtml();
+    if (!built) { alert('Compute a payroll batch for this period first.'); return; }
+    showPreview(built.html);
+  }
+
+  function showPreview(html, isPayslip = false) {
+    const content = document.getElementById('preview-sheet-content');
+    content.innerHTML = html;
+    content.classList.toggle('payslip-print', isPayslip);
+    document.getElementById('payroll-preview').classList.remove('hidden');
+  }
+
+  function closePayrollPreview() {
+    document.getElementById('payroll-preview').classList.add('hidden');
+  }
+
+  function emailPayrollSheet() {
+    const built = buildPayrollSheetHtml();
+    if (!built) return;
+    const period = periodsCache.find(p => p.id === currentPeriodId);
+    const f = (n) => (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+    const subject = `Mechatrade Payroll Register — ${period.cutoff_start} to ${period.cutoff_end}`;
+    const body = [
+      `Payroll register for cutoff ${period.cutoff_start} to ${period.cutoff_end} (pay date: ${period.pay_date || '—'}).`,
+      ``,
+      `Employees: ${built.employeeCount}`,
+      `Total gross: ₱${f(built.totals.gross)}`,
+      `Total deductions: ₱${f(built.totals.deductions)}`,
+      `Total net pay: ₱${f(built.totals.net)}`,
+      ``,
+      `The full payroll sheet is attached as a PDF (use "Print / Save as PDF" on the preview screen, then attach the saved file here before sending).`
+    ].join('\n');
+    window.location.href = `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
   }
 
   async function saveBatch() {
     if (!currentPeriodId) return;
-    const rows = document.querySelectorAll('#processing-tbody tr[data-emp-id]');
+    const rows = document.querySelectorAll('#processing-tbody-monthly tr[data-emp-id], #processing-tbody-daily tr[data-emp-id]');
     if (!rows.length) return;
     const saveBtn = document.getElementById('save-batch-btn');
     saveBtn.disabled = true;
     saveBtn.textContent = 'Saving…';
+    const cashAdvanceByEmployee = {};
     for (const tr of rows) {
       const empId = tr.dataset.empId;
       const rec = JSON.parse(tr.dataset.record || '{}');
-      await addDoc(collection(db, 'payroll_records'), {
+      cashAdvanceByEmployee[empId] = rec.cashAdvanceDeduction || 0;
+      await setDoc(doc(db, 'payroll_records', `${currentPeriodId}_${empId}`), {
         control_number: currentPeriodId,
         period_id: currentPeriodId,
         employee_id: empId,
         ...rec,
-        status: 'draft',
-        created_at: serverTimestamp()
-      });
+        status: 'for_approval',
+        updated_at: serverTimestamp()
+      }, { merge: true });
     }
+    await applyCashAdvanceDeductions(currentPeriodId, cashAdvanceByEmployee);
     await updateDoc(doc(db, 'payroll_periods', currentPeriodId), { status: 'for_approval' });
     saveBtn.disabled = false;
     saveBtn.textContent = 'Save & send for approval';
     alert('Payroll batch saved and marked for approval.');
+  }
+
+  async function fetchRecordsForPeriod(periodId) {
+    const q = query(collection(db, 'payroll_records'), where('period_id', '==', periodId));
+    const snap = await getDocs(q);
+    const records = [];
+    snap.forEach(d => records.push({ id: d.id, ...d.data() }));
+    records.sort((a, b) => (a.employee_id || '').localeCompare(b.employee_id || ''));
+    return records;
+  }
+
+  async function approvePeriod(periodId) {
+    const records = await fetchRecordsForPeriod(periodId);
+    for (const rec of records) {
+      await updateDoc(doc(db, 'payroll_records', rec.id), { status: 'approved' });
+    }
+    await updateDoc(doc(db, 'payroll_periods', periodId), { status: 'approved' });
+  }
+
+  async function sendPeriodBackToDraft(periodId) {
+    const records = await fetchRecordsForPeriod(periodId);
+    for (const rec of records) {
+      await updateDoc(doc(db, 'payroll_records', rec.id), { status: 'draft' });
+    }
+    await reverseCashAdvanceDeductions(periodId);
+    await updateDoc(doc(db, 'payroll_periods', periodId), { status: 'draft' });
+  }
+
+  async function releasePeriod(periodId) {
+    const records = await fetchRecordsForPeriod(periodId);
+    for (const rec of records) {
+      await updateDoc(doc(db, 'payroll_records', rec.id), { status: 'released' });
+    }
+    await updateDoc(doc(db, 'payroll_periods', periodId), { status: 'released' });
+  }
+
+  // ---------- Approval ----------
+  function renderApprovalList() {
+    const tbody = document.getElementById('approval-periods-tbody');
+    if (!tbody) return;
+    const rows = periodsCache.filter(p => p.status !== 'draft').map(p => `
+      <tr>
+        <td>${p.cutoff_start} – ${p.cutoff_end}</td>
+        <td><span class="status status-${p.status === 'released' ? 'active' : 'inactive'}">${p.status}</span></td>
+        <td><button class="btn-icon" style="color:var(--navy);" onclick="__mpReviewPeriod('${p.id}')">Review</button></td>
+      </tr>`).join('');
+    tbody.innerHTML = rows || `<tr><td colspan="3" class="empty">No periods submitted for approval yet.</td></tr>`;
+  }
+
+  window.__mpReviewPeriod = async (periodId) => {
+    const built = await buildRegisterFromRecords(periodId);
+    const period = periodsCache.find(p => p.id === periodId);
+    const wrap = document.getElementById('approval-review-wrap');
+    wrap.classList.remove('hidden');
+    if (!built) {
+      document.getElementById('approval-review-content').innerHTML = '<div class="empty">No saved payroll records for this period.</div>';
+      document.getElementById('approval-actions').innerHTML = '';
+      return;
+    }
+    document.getElementById('approval-review-content').innerHTML = built.html;
+
+    let actionsHtml = `<button class="btn-icon" onclick="__mpPrintPeriod('${periodId}')" style="color:var(--navy);">Print / Save as PDF</button>`;
+    if (currentUserRole === 'admin') {
+      if (period.status === 'for_approval') {
+        actionsHtml += ` <button class="btn-add" style="margin-left:14px;" onclick="__mpApprove('${periodId}')">Approve batch</button>
+          <button class="btn-icon" style="margin-left:10px; color:var(--red);" onclick="__mpSendBack('${periodId}')">Send back to draft</button>`;
+      } else if (period.status === 'approved') {
+        actionsHtml += ` <button class="btn-add" style="margin-left:14px;" onclick="__mpRelease('${periodId}')">Mark as released (paid)</button>`;
+      } else if (period.status === 'released') {
+        actionsHtml += ` <span style="margin-left:14px; color:var(--muted); font-size:12.5px;">Released — no further action.</span>`;
+      }
+    } else {
+      actionsHtml += ` <span style="margin-left:14px; color:var(--muted); font-size:12.5px;">Admin approval required to change status.</span>`;
+    }
+    document.getElementById('approval-actions').innerHTML = actionsHtml;
+  };
+
+  window.__mpPrintPeriod = async (periodId) => {
+    const built = await buildRegisterFromRecords(periodId);
+    if (built) showPreview(built.html);
+  };
+
+  window.__mpApprove = async (periodId) => {
+    const records = await fetchRecordsForPeriod(periodId);
+    if (!records.length) { alert('This period has no saved payroll records — process it first.'); return; }
+    if (!confirm('Approve this payroll batch?')) return;
+    await approvePeriod(periodId);
+    __mpReviewPeriod(periodId);
+  };
+
+  window.__mpSendBack = async (periodId) => {
+    if (!confirm('Send this batch back to draft? It will need to be reprocessed and resubmitted.')) return;
+    await sendPeriodBackToDraft(periodId);
+    __mpReviewPeriod(periodId);
+  };
+
+  window.__mpRelease = async (periodId) => {
+    const records = await fetchRecordsForPeriod(periodId);
+    if (!records.length) { alert('This period has no saved payroll records — nothing to release.'); return; }
+    if (!confirm('Mark this batch as released (paid)? This should only be done once payment has actually gone out.')) return;
+    await releasePeriod(periodId);
+    __mpReviewPeriod(periodId);
+  };
+
+  // ---------- Payslips ----------
+  function populatePayslipPeriodSelect() {
+    const sel = document.getElementById('payslip-period-select');
+    if (!sel) return;
+    const eligible = periodsCache.filter(p => p.status !== 'draft');
+    sel.innerHTML = eligible.map(p => `<option value="${p.id}">${p.cutoff_start} – ${p.cutoff_end} (${p.status})</option>`).join('')
+      || '<option value="">No processed periods yet</option>';
+    if (eligible.length) loadPayslipEmployees(eligible[0].id);
+  }
+
+  async function loadPayslipEmployees(periodId) {
+    const sel = document.getElementById('payslip-employee-select');
+    if (!sel || !periodId) return;
+    const records = await fetchRecordsForPeriod(periodId);
+    sel.innerHTML = records.map(rec => {
+      const emp = employeesCache.find(e => e.id === rec.employee_id);
+      return `<option value="${rec.employee_id}">${emp ? emp.name : rec.employee_id}</option>`;
+    }).join('') || '<option value="">No records for this period</option>';
+  }
+
+  async function viewPayslip() {
+    const periodId = document.getElementById('payslip-period-select').value;
+    const employeeId = document.getElementById('payslip-employee-select').value;
+    if (!periodId || !employeeId) return;
+    const html = await buildIndividualPayslipHtml(periodId, employeeId);
+    if (!html) { alert('No payslip found for this employee in this period.'); return; }
+    document.getElementById('payslip-view-content').innerHTML = html;
+    document.getElementById('payslip-view-wrap').classList.remove('hidden');
+  }
+
+  async function printPayslip() {
+    const periodId = document.getElementById('payslip-period-select').value;
+    const employeeId = document.getElementById('payslip-employee-select').value;
+    if (!periodId || !employeeId) return;
+    const html = await buildIndividualPayslipHtml(periodId, employeeId);
+    if (!html) { alert('No payslip found for this employee in this period.'); return; }
+    showPreview(html, true);
+  }
+
+  // ---------- Reports ----------
+  function populateReportPeriodSelect() {
+    const sel = document.getElementById('report-period-select');
+    if (!sel) return;
+    const eligible = periodsCache.filter(p => p.status !== 'draft');
+    sel.innerHTML = eligible.map(p => `<option value="${p.id}">${p.cutoff_start} – ${p.cutoff_end} (${p.status})</option>`).join('')
+      || '<option value="">No processed periods yet</option>';
+  }
+
+  async function viewReport() {
+    const periodId = document.getElementById('report-period-select').value;
+    if (!periodId) return;
+    const built = await buildRegisterFromRecords(periodId);
+    const wrap = document.getElementById('report-wrap');
+    if (!built) {
+      wrap.classList.remove('hidden');
+      document.getElementById('report-stats').innerHTML = '';
+      document.getElementById('report-register-content').innerHTML = '<div class="empty">No saved payroll records for this period.</div>';
+      return;
+    }
+    const f = (n) => '₱' + (n || 0).toLocaleString('en-PH', { minimumFractionDigits: 2 });
+    document.getElementById('report-stats').innerHTML = `
+      <div class="stat-cell"><div class="stat-label">Total SSS (employee)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.sss)}</div></div>
+      <div class="stat-cell"><div class="stat-label">Total PhilHealth (employee)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.philhealth)}</div></div>
+      <div class="stat-cell"><div class="stat-label">Total Pag-IBIG (employee)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.pagibig)}</div></div>
+      <div class="stat-cell"><div class="stat-label">Total withholding tax</div><div class="stat-value" style="font-size:17px;">${f(built.totals.tax)}</div></div>
+      <div class="stat-cell"><div class="stat-label">Total SSS (employer)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.sssEmployer)}</div></div>
+      <div class="stat-cell"><div class="stat-label">Total SSS EC (employer)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.sssEC)}</div></div>
+      <div class="stat-cell"><div class="stat-label">Total PhilHealth (employer)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.philhealthEmployer)}</div></div>
+      <div class="stat-cell"><div class="stat-label">Total Pag-IBIG (employer)</div><div class="stat-value" style="font-size:17px;">${f(built.totals.pagibigEmployer)}</div></div>
+    `;
+    document.getElementById('report-register-content').innerHTML = built.html;
+    wrap.classList.remove('hidden');
+  }
+
+  async function printReport() {
+    const periodId = document.getElementById('report-period-select').value;
+    if (!periodId) return;
+    const built = await buildRegisterFromRecords(periodId);
+    if (built) showPreview(built.html);
   }
 
   function loadEmployeesForProcessing() {
@@ -390,7 +2401,17 @@
     onSnapshot(q, (snap) => {
       employeesCache = [];
       snap.forEach(d => employeesCache.push({ id: d.id, ...d.data() }));
+      populateManualAttEmployeeSelect();
+      populateCAEmployeeSelect();
     });
+  }
+
+  function populateCAEmployeeSelect() {
+    const sel = document.getElementById('ca-employee');
+    if (!sel) return;
+    const active = employeesCache.filter(e => e.status === 'active');
+    sel.innerHTML = active.map(e => `<option value="${e.id}">${e.name} (${e.rate_type === 'daily' ? '₱' + e.rate_amount + '/day' : '₱' + e.rate_amount + '/mo'})</option>`).join('')
+      || '<option value="">No active employees</option>';
   }
 </script>
 
@@ -488,6 +2509,24 @@
     border-color: var(--navy);
   }
 
+  .password-field { position: relative; }
+  .password-field input { padding-right: 38px; }
+  .toggle-password {
+    position: absolute;
+    right: 6px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    padding: 6px;
+    cursor: pointer;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+  }
+  .toggle-password:hover { color: var(--navy); }
+  .toggle-password:focus-visible { outline: 2px solid var(--gold); outline-offset: 1px; }
+
   .btn-primary {
     width: 100%;
     padding: 11px;
@@ -563,7 +2602,7 @@
   .main {
     flex: 1;
     padding: 28px 36px 60px;
-    max-width: 1100px;
+    max-width: 1440px;
   }
 
   .topbar {
@@ -604,6 +2643,16 @@
 
   .panel h3 { font-size: 16px; margin-bottom: 4px; }
   .panel .panel-sub { color: var(--muted); font-size: 12.5px; margin-bottom: 18px; }
+
+  /* ---------- Attendance: two-column layout (pull/pulled-records left, manual entry right) ---------- */
+  .attendance-grid {
+    display: grid;
+    grid-template-columns: 1.3fr 1fr;
+    gap: 24px;
+    align-items: start;
+  }
+  .attendance-col-left, .attendance-col-right { min-width: 0; }
+  .attendance-col-right .panel { margin-bottom: 0; }
 
   /* ---------- Forms (employee entry) ---------- */
   .form-grid {
@@ -649,6 +2698,9 @@
 
   .tag-daily { border-color: var(--gold); color: #8a6a1f; background: var(--gold-soft); }
   .tag-monthly { border-color: var(--navy-soft); color: var(--navy-soft); background: #EAEEF5; }
+  .tag-ot { border-color: var(--gold); color: #8a6a1f; background: var(--gold-soft); font-weight: 600; }
+  .tag-undertime { border-color: var(--red); color: var(--red); background: #FBEAE8; font-weight: 600; }
+  .tag-nd { border-color: var(--navy); color: var(--navy); background: #EAEEF5; font-weight: 600; }
 
   .status { font-size: 12.5px; }
   .status-active { color: var(--green); }
@@ -685,6 +2737,83 @@
 
   .coming-soon h3 { color: var(--navy); margin-bottom: 8px; }
 
+  /* ---------- Payroll sheet preview / print ---------- */
+  .preview-overlay {
+    position: fixed;
+    inset: 0;
+    background: #E7EAEE;
+    z-index: 200;
+    overflow-y: auto;
+  }
+
+  .preview-toolbar {
+    position: sticky;
+    top: 0;
+    background: var(--navy);
+    padding: 14px 28px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    z-index: 2;
+  }
+
+  .preview-toolbar-title { color: #fff; font-family: 'IBM Plex Serif', serif; font-size: 15px; }
+  .preview-toolbar-actions { display: flex; align-items: center; gap: 4px; }
+  .preview-toolbar-actions .btn-icon { color: #DCE4EF; }
+  .preview-toolbar-actions .btn-icon:hover { color: #fff; }
+
+  .preview-sheet {
+    max-width: 900px;
+    margin: 28px auto 60px;
+    background: #fff;
+    padding: 48px;
+    border: 1px solid var(--line);
+  }
+
+  .sheet-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 28px; padding-bottom: 20px; border-bottom: 2px solid var(--navy); }
+  .sheet-header img { height: 52px; }
+  .sheet-header .sheet-title { text-align: right; }
+  .sheet-header .sheet-title h2 { font-size: 19px; color: var(--navy); }
+  .sheet-header .sheet-title div { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+  .sheet-meta { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 24px; font-size: 12.5px; }
+  .sheet-meta div span { display: block; color: var(--muted); font-size: 11px; margin-bottom: 2px; }
+
+  .sheet-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .sheet-table th { text-align: right; background: var(--paper); padding: 7px 8px; border: 1px solid var(--line); font-weight: 500; color: var(--muted); }
+  .sheet-table th:first-child { text-align: left; }
+  .sheet-table td { padding: 7px 8px; border: 1px solid var(--line); text-align: right; font-family: 'IBM Plex Mono', monospace; }
+  .sheet-table td:first-child { text-align: left; font-family: 'IBM Plex Sans', sans-serif; }
+  .sheet-table tfoot td { font-weight: 600; background: var(--paper); }
+
+  .sheet-footer { margin-top: 28px; font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; }
+
+  @page { margin: 0; }
+  @page payslip { size: A5; margin: 0; }
+
+  @media print {
+    body * { visibility: hidden; }
+    .preview-sheet, .preview-sheet * { visibility: visible; }
+    .preview-sheet { position: absolute; top: 0; left: 0; width: 100%; margin: 0; border: none; padding: 24px; }
+    .no-print { display: none !important; }
+
+    /* Payslip prints at a fixed A5 box, centered on whatever paper size the
+       print dialog actually uses (A4, Letter, Legal, etc.) — `page: payslip`
+       is a hint honored by Chrome to set the sheet itself to A5, and the
+       fixed width + auto margins keep it centered even in browsers that
+       ignore that hint and fall back to the printer's default paper size. */
+    .preview-sheet.payslip-print {
+      page: payslip;
+      left: 0;
+      right: 0;
+      width: 148mm;
+      min-height: 210mm;
+      margin: 0 auto;
+      padding: 12mm;
+      box-sizing: border-box;
+    }
+  }
+
   @media (max-width: 760px) {
     #app-shell { flex-direction: column; }
     .sidebar { width: 100%; display: flex; overflow-x: auto; padding: 0; }
@@ -694,6 +2823,7 @@
     .form-grid { grid-template-columns: 1fr; }
     .stat-grid { grid-template-columns: repeat(2, 1fr); }
     .main { padding: 20px; }
+    .attendance-grid { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -712,7 +2842,13 @@
     </div>
     <div class="field">
       <label for="login-password">Password</label>
-      <input type="password" id="login-password" required autocomplete="current-password">
+      <div class="password-field">
+        <input type="password" id="login-password" required autocomplete="current-password">
+        <button type="button" class="toggle-password" data-target="login-password" aria-label="Show password">
+          <svg class="icon-eye" viewBox="0 0 20 20" width="16" height="16"><path d="M10 4C5.5 4 2 10 2 10s3.5 6 8 6 8-6 8-6-3.5-6-8-6zm0 10a4 4 0 110-8 4 4 0 010 8z" fill="currentColor"/><circle cx="10" cy="10" r="1.8" fill="var(--paper)"/></svg>
+          <svg class="icon-eye-off hidden" viewBox="0 0 20 20" width="16" height="16"><path d="M3 3l14 14M8.3 8.4a2.5 2.5 0 003.3 3.3M6.1 6.2C3.9 7.4 2 10 2 10s3.5 6 8 6c1.4 0 2.7-.5 3.9-1.2M10 4c4.5 0 8 6 8 6a13.6 13.6 0 01-2.3 2.9" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>
+        </button>
+      </div>
     </div>
     <button type="submit" class="btn-primary">Sign in</button>
     <div class="login-error" id="login-error"></div>
@@ -730,11 +2866,23 @@
     </div>
     <div class="field">
       <label for="signup-password">Password</label>
-      <input type="password" id="signup-password" required autocomplete="new-password" minlength="6">
+      <div class="password-field">
+        <input type="password" id="signup-password" required autocomplete="new-password" minlength="6">
+        <button type="button" class="toggle-password" data-target="signup-password" aria-label="Show password">
+          <svg class="icon-eye" viewBox="0 0 20 20" width="16" height="16"><path d="M10 4C5.5 4 2 10 2 10s3.5 6 8 6 8-6 8-6-3.5-6-8-6zm0 10a4 4 0 110-8 4 4 0 010 8z" fill="currentColor"/><circle cx="10" cy="10" r="1.8" fill="var(--paper)"/></svg>
+          <svg class="icon-eye-off hidden" viewBox="0 0 20 20" width="16" height="16"><path d="M3 3l14 14M8.3 8.4a2.5 2.5 0 003.3 3.3M6.1 6.2C3.9 7.4 2 10 2 10s3.5 6 8 6c1.4 0 2.7-.5 3.9-1.2M10 4c4.5 0 8 6 8 6a13.6 13.6 0 01-2.3 2.9" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>
+        </button>
+      </div>
     </div>
     <div class="field">
       <label for="signup-password-confirm">Confirm password</label>
-      <input type="password" id="signup-password-confirm" required autocomplete="new-password" minlength="6">
+      <div class="password-field">
+        <input type="password" id="signup-password-confirm" required autocomplete="new-password" minlength="6">
+        <button type="button" class="toggle-password" data-target="signup-password-confirm" aria-label="Show password">
+          <svg class="icon-eye" viewBox="0 0 20 20" width="16" height="16"><path d="M10 4C5.5 4 2 10 2 10s3.5 6 8 6 8-6 8-6-3.5-6-8-6zm0 10a4 4 0 110-8 4 4 0 010 8z" fill="currentColor"/><circle cx="10" cy="10" r="1.8" fill="var(--paper)"/></svg>
+          <svg class="icon-eye-off hidden" viewBox="0 0 20 20" width="16" height="16"><path d="M3 3l14 14M8.3 8.4a2.5 2.5 0 003.3 3.3M6.1 6.2C3.9 7.4 2 10 2 10s3.5 6 8 6c1.4 0 2.7-.5 3.9-1.2M10 4c4.5 0 8 6 8 6a13.6 13.6 0 01-2.3 2.9" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>
+        </button>
+      </div>
     </div>
     <button type="submit" class="btn-primary">Create account</button>
     <div class="login-error" id="signup-error"></div>
@@ -749,10 +2897,14 @@
     <button class="nav-item active" data-target="view-dashboard">Dashboard</button>
     <button class="nav-item" data-target="view-employees">Employees</button>
     <button class="nav-item" data-target="view-attendance">Attendance</button>
+    <button class="nav-item" data-target="view-holidays">Holidays</button>
+    <button class="nav-item" data-target="view-cashadvance">Cash Advance</button>
     <button class="nav-item" data-target="view-processing">Payroll Processing</button>
     <button class="nav-item" data-target="view-approval">Approval</button>
     <button class="nav-item" data-target="view-payslip">Payslips</button>
     <button class="nav-item" data-target="view-reports">Reports</button>
+    <button class="nav-item" data-target="view-taxcomputation">Tax Computation</button>
+    <button class="nav-item" id="nav-settings-btn" data-target="view-settings">Settings</button>
   </nav>
 
   <main class="main">
@@ -798,13 +2950,17 @@
     <!-- Employees -->
     <section id="view-employees" class="view hidden">
       <div class="panel">
-        <h3>Add employee</h3>
+        <h3 id="employee-form-title">Add employee</h3>
         <div class="panel-sub">Set the rate type first — it determines how basic pay is computed.</div>
         <form id="employee-form">
           <div class="form-grid">
             <div class="field">
               <label for="emp-name">Full name</label>
               <input type="text" id="emp-name" required>
+            </div>
+            <div class="field">
+              <label for="emp-email">Email (PulseTime login)</label>
+              <input type="email" id="emp-email" placeholder="used to match timetracker entries">
             </div>
             <div class="field">
               <label for="emp-position">Position</label>
@@ -846,7 +3002,8 @@
               <input type="text" id="emp-tin">
             </div>
           </div>
-          <button type="submit" class="btn-add">Add employee</button>
+          <button type="submit" class="btn-add" id="employee-submit-btn">Add employee</button>
+          <button type="button" class="btn-icon hidden" id="employee-cancel-btn" style="margin-left:14px;">Cancel edit</button>
         </form>
       </div>
 
@@ -868,8 +3025,162 @@
 
     <!-- Placeholder views -->
     <section id="view-attendance" class="view hidden">
-      <div class="coming-soon"><h3>Attendance</h3>Daily time log entry and CSV import from biometrics — next module.</div>
+      <div class="attendance-grid">
+      <div class="attendance-col-left">
+      <div class="panel">
+        <h3>Pull attendance from PulseTime</h3>
+        <div class="panel-sub">Reads raw time-in/time-out sessions for a cutoff's date range from Mechatrade PulseTime (read-only), matched to employees by email.</div>
+        <div class="form-grid" style="grid-template-columns: 2fr 1fr; align-items: end;">
+          <div class="field">
+            <label for="att-period-select">Payroll period</label>
+            <select id="att-period-select" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+          </div>
+          <button type="button" class="btn-add" id="pull-pulsetime-btn">Pull from PulseTime</button>
+        </div>
+      </div>
+
+      <div class="panel hidden" id="attendance-summary-wrap">
+        <h3>Pulled daily records</h3>
+        <div class="panel-sub">One row per employee per Mon–Fri workday in the cutoff (Saturdays/Sundays are excluded unless the employee actually worked that day, in which case it's shown and paid normally). Weekday rows with zero PulseTime entries auto-default to Unpaid Leave — change the dropdown per day if it was actually paid, emergency, or a half day. Late isn't auto-calculated (no fixed shift start time); Undertime is based on hours short of 8 worked (after a 1hr unpaid lunch on sessions over an hour).</div>
+        <div style="overflow-x:auto;">
+        <table>
+          <thead><tr>
+            <th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th>
+            <th class="num">Regular hrs</th><th class="num">OT hrs</th><th class="num">Undertime (min)</th>
+            <th>Leave</th><th>Pay flags</th><th style="min-width:140px;">Attendance Status</th>
+          </tr></thead>
+          <tbody id="attendance-summary-tbody"></tbody>
+        </table>
+        </div>
+        <div id="attendance-unmatched" class="hidden" style="margin-top:14px; font-size:12.5px; color:var(--red);"></div>
+        <div style="margin-top:18px;">
+          <button class="btn-add" id="save-attendance-btn">Save to payroll attendance</button>
+        </div>
+      </div>
+      </div>
+
+      <div class="attendance-col-right">
+      <div class="panel" id="manual-attendance-panel">
+        <h3 id="manual-att-form-title">Manual time entry</h3>
+        <div class="panel-sub">For staff not enrolled in PulseTime (or to hand-correct a specific day). Uses the payroll period selected on the left — pick that first. Saving a manual entry for a date that was already pulled from PulseTime replaces that day's record.</div>
+        <form id="manual-att-form" class="form-grid" style="grid-template-columns: 1fr 1fr; align-items: end; gap:12px;">
+          <div class="field">
+            <label for="manual-att-employee">Employee</label>
+            <select id="manual-att-employee" required style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+          </div>
+          <div class="field">
+            <label for="manual-att-date">Date</label>
+            <input type="date" id="manual-att-date" required style="width:100%; padding:10px 12px; border:1px solid var(--line); font-family:inherit; font-size:14px;">
+          </div>
+          <div class="field">
+            <label for="manual-att-timein">Time in</label>
+            <input type="time" id="manual-att-timein" style="width:100%; padding:10px 12px; border:1px solid var(--line); font-family:inherit; font-size:14px;">
+          </div>
+          <div class="field">
+            <label for="manual-att-timeout">Time out</label>
+            <input type="time" id="manual-att-timeout" style="width:100%; padding:10px 12px; border:1px solid var(--line); font-family:inherit; font-size:14px;">
+          </div>
+          <div class="field" style="grid-column: 1 / -1;">
+            <label for="manual-att-status">Attendance status</label>
+            <select id="manual-att-status" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+          </div>
+          <div style="grid-column: 1 / -1; display:flex; gap:10px; margin-top:4px;">
+            <button type="submit" class="btn-add" id="manual-att-save-btn">Add entry</button>
+            <button type="button" class="btn-icon hidden" id="manual-att-cancel-btn">Cancel edit</button>
+          </div>
+        </form>
+        <div class="panel-sub" style="margin-top:6px;">Leave a whole day out of time in/out and pick a status (e.g. Paid Leave) instead — hours are left at 0 for those days.</div>
+
+        <div style="overflow-x:auto; margin-top:18px;">
+        <table>
+          <thead><tr>
+            <th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th><th>Status</th><th>Pay flags</th><th>Actions</th>
+          </tr></thead>
+          <tbody id="manual-att-tbody"><tr><td colspan="7" class="empty">Select a payroll period above.</td></tr></tbody>
+        </table>
+        </div>
+      </div>
+      </div>
+      </div>
     </section>
+    <section id="view-holidays" class="view hidden">
+      <div class="panel">
+        <h3>Holiday calendar</h3>
+        <div class="panel-sub">Declares which dates are Regular Holidays, Special (Non-working) Days, or Double Holidays (two regular holidays coinciding). Feeds automatic holiday/rest-day pay computation in Attendance and Payroll Processing — add dates as they're proclaimed for the year.</div>
+        <form id="holiday-form" class="form-grid" style="grid-template-columns: 1fr 1.2fr 1.4fr; align-items: end;">
+          <div class="field">
+            <label for="holiday-date">Date</label>
+            <input type="date" id="holiday-date" required>
+          </div>
+          <div class="field">
+            <label for="holiday-type">Type</label>
+            <select id="holiday-type" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;">
+              <option value="regular">Regular Holiday</option>
+              <option value="special_non_working">Special (Non-working) Day</option>
+              <option value="double">Double Holiday</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="holiday-label">Label</label>
+            <input type="text" id="holiday-label" placeholder="e.g. National Heroes Day">
+          </div>
+          <div style="grid-column: 1 / -1;">
+            <button type="submit" class="btn-add">Add holiday</button>
+          </div>
+        </form>
+      </div>
+      <div class="panel">
+        <h3>Declared dates</h3>
+        <table>
+          <thead><tr><th>Date</th><th>Type</th><th>Label</th><th></th></tr></thead>
+          <tbody id="holidays-tbody"><tr><td colspan="4" class="empty">No holidays declared yet.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="view-cashadvance" class="view hidden">
+      <div class="panel">
+        <h3>Grant cash advance</h3>
+        <div class="panel-sub">One active cash advance per employee at a time — split into equal installments, auto-deducted each cutoff in Payroll Processing until fully paid.</div>
+        <form id="ca-form">
+          <div class="form-grid">
+            <div class="field">
+              <label for="ca-employee">Employee</label>
+              <select id="ca-employee" required style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+            </div>
+            <div class="field">
+              <label for="ca-amount">Total amount (₱)</label>
+              <input type="number" id="ca-amount" step="0.01" min="0.01" required>
+            </div>
+            <div class="field">
+              <label for="ca-terms">Number of terms</label>
+              <input type="number" id="ca-terms" step="1" min="1" value="1" required>
+            </div>
+            <div class="field">
+              <label for="ca-date">Date granted</label>
+              <input type="date" id="ca-date">
+            </div>
+            <div class="field">
+              <label for="ca-notes">Notes</label>
+              <input type="text" id="ca-notes" placeholder="optional">
+            </div>
+          </div>
+          <button type="submit" class="btn-add">Grant cash advance</button>
+        </form>
+      </div>
+
+      <div class="panel">
+        <h3>Cash advance ledger</h3>
+        <table>
+          <thead><tr>
+            <th>Employee</th><th class="num">Amount</th><th class="num">Terms</th><th class="num">Per term</th>
+            <th class="num">Balance</th><th>Progress</th><th>Status</th><th>Granted</th><th></th>
+          </tr></thead>
+          <tbody id="cashadvance-tbody"><tr><td colspan="9" class="empty">No cash advances yet.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
     <section id="view-processing" class="view hidden">
       <div class="panel">
         <h3>New payroll period</h3>
@@ -911,36 +3222,255 @@
       <div class="panel hidden" id="processing-workspace">
         <h3>Process cutoff</h3>
         <div class="panel-sub">
-          Enter days present and OT hours per employee. Statutory basis:
-          <select id="period-type-active" data-type="semi-monthly" style="border:1px solid var(--line); font-family:inherit; padding:4px 8px;">
-            <option value="semi-monthly" selected>Semi-monthly (half contributions per cutoff)</option>
-            <option value="monthly">Monthly (full contributions this cutoff)</option>
-          </select>
+          <span id="period-type-label"></span>
+          <span id="cutoff-position-badge" style="margin-left:14px; font-size:12.5px; color:var(--gold); font-weight:500;"></span>
         </div>
+
+        <h3 style="font-size:14px; margin-top:24px; margin-bottom:2px;">Monthly-rate employees</h3>
+        <div class="panel-sub" style="margin-bottom:12px;">Semi-monthly Base = Monthly Salary ÷ 2, minus Unpaid Days deduction, plus OT/Holiday/Rest Day/NSD/Other Earnings. Holiday, rest day, and NSD pay are pre-filled from attendance using DOLE premium rates — override if needed.</div>
+        <div style="overflow-x:auto;">
         <table>
           <thead>
             <tr>
-              <th>Employee</th><th>Days present</th><th>OT hours</th><th>Allowances (₱)</th>
+              <th>Employee</th><th>Unpaid days</th><th>OT hours</th>
+              <th>Holiday pay (₱)</th><th>Rest day pay (₱)</th><th>NSD pay (₱)</th><th>Other earnings (₱)</th><th>Cash advance (₱)</th>
               <th class="num">Gross</th><th class="num">Deductions</th><th class="num">Net pay</th>
             </tr>
           </thead>
-          <tbody id="processing-tbody"></tbody>
+          <tbody id="processing-tbody-monthly"></tbody>
         </table>
+        </div>
+
+        <h3 style="font-size:14px; margin-top:28px; margin-bottom:2px;">Daily-rate employees</h3>
+        <div class="panel-sub" style="margin-bottom:12px;">Basic Pay = Daily Rate × Payable Days, plus OT/Holiday/Rest Day/NSD/Other Earnings. Holiday, rest day, and NSD pay are pre-filled from attendance using DOLE premium rates — override if needed.</div>
+        <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Employee</th><th>Payable days</th><th>OT hours</th>
+              <th>Holiday pay (₱)</th><th>Rest day pay (₱)</th><th>NSD pay (₱)</th><th>Other earnings (₱)</th><th>Cash advance (₱)</th>
+              <th class="num">Gross</th><th class="num">Deductions</th><th class="num">Net pay</th>
+            </tr>
+          </thead>
+          <tbody id="processing-tbody-daily"></tbody>
+        </table>
+        </div>
+
+
         <div style="margin-top:18px;">
           <button class="btn-add" id="save-batch-btn">Save &amp; send for approval</button>
+          <button class="btn-icon" id="preview-sheet-btn" style="margin-left:16px; color:var(--navy);">Preview payroll sheet</button>
         </div>
       </div>
     </section>
     <section id="view-approval" class="view hidden">
-      <div class="coming-soon"><h3>Approval</h3>Review and approve a payroll batch before release — next module.</div>
+      <div class="panel">
+        <h3>Periods awaiting or past approval</h3>
+        <div class="panel-sub">Only submitted batches (status: for approval, approved, or released) appear here. Approving requires an admin account.</div>
+        <table>
+          <thead><tr><th>Cutoff</th><th>Status</th><th></th></tr></thead>
+          <tbody id="approval-periods-tbody"><tr><td colspan="3" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+
+      <div class="panel hidden" id="approval-review-wrap">
+        <h3>Review</h3>
+        <div id="approval-review-content"></div>
+        <div id="approval-actions" style="margin-top:18px;"></div>
+      </div>
     </section>
     <section id="view-payslip" class="view hidden">
-      <div class="coming-soon"><h3>Payslips</h3>Individual payslip view and print — next module.</div>
+      <div class="panel">
+        <h3>View payslip</h3>
+        <div class="panel-sub">Pulls from saved, processed payroll records — only periods that have been through Payroll Processing appear here.</div>
+        <div class="form-grid" style="grid-template-columns: 2fr 2fr 1fr; align-items: end;">
+          <div class="field">
+            <label for="payslip-period-select">Payroll period</label>
+            <select id="payslip-period-select" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+          </div>
+          <div class="field">
+            <label for="payslip-employee-select">Employee</label>
+            <select id="payslip-employee-select" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+          </div>
+          <button type="button" class="btn-add" id="view-payslip-btn">View payslip</button>
+        </div>
+      </div>
+
+      <div class="panel hidden" id="payslip-view-wrap">
+        <h3>Payslip</h3>
+        <div id="payslip-view-content"></div>
+        <div style="margin-top:18px;">
+          <button class="btn-icon" id="print-payslip-btn" style="color:var(--navy);">Print / Save as PDF</button>
+        </div>
+      </div>
     </section>
     <section id="view-reports" class="view hidden">
-      <div class="coming-soon"><h3>Reports</h3>Payroll register and government remittance reports (SSS R3, PhilHealth, Pag-IBIG) — next module.</div>
+      <div class="panel">
+        <h3>Payroll register &amp; statutory summary</h3>
+        <div class="panel-sub">Select a processed period to see total government contributions and the full register. This is a summary view — always cross-check against the official SSS/PhilHealth/Pag-IBIG/BIR forms before remitting.</div>
+        <div class="form-grid" style="grid-template-columns: 2fr 1fr 1fr; align-items: end;">
+          <div class="field">
+            <label for="report-period-select">Payroll period</label>
+            <select id="report-period-select" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;"></select>
+          </div>
+          <button type="button" class="btn-add" id="view-report-btn">View report</button>
+          <button type="button" class="btn-icon" id="print-report-btn" style="color:var(--navy);">Print / Save as PDF</button>
+        </div>
+      </div>
+
+      <div class="panel hidden" id="report-wrap">
+        <div class="stat-grid" id="report-stats" style="margin-bottom:24px;"></div>
+        <div id="report-register-content"></div>
+      </div>
+    </section>
+
+    <section id="view-taxcomputation" class="view hidden">
+      <div class="panel">
+        <h3>Philippine Withholding Tax Table</h3>
+        <div class="panel-sub">BIR TRAIN Law brackets, currently in effect (source: whatever's set in Settings — this always reflects the live rates the payroll engine actually uses, not a separate copy).</div>
+        <div style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>Monthly taxable income</th><th class="num">Base tax (monthly)</th><th class="num">Rate on excess</th></tr></thead>
+          <tbody id="taxtable-monthly-tbody"></tbody>
+        </table>
+        </div>
+        <h3 style="font-size:14px; margin-top:24px; margin-bottom:2px;">Annual equivalent</h3>
+        <div class="panel-sub" style="margin-bottom:12px;">Same brackets × 12 — the format most commonly published by BIR, for reference.</div>
+        <div style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>Annual taxable income</th><th class="num">Base tax (annual)</th><th class="num">Rate on excess</th></tr></thead>
+          <tbody id="taxtable-annual-tbody"></tbody>
+        </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Tax calculator</h3>
+        <div class="panel-sub">Manual check — uses the exact same formulas as Payroll Processing (SSS/PhilHealth/Pag-IBIG employee shares deducted first, then tax on what's left). Enter a monthly compensation figure to see the full breakdown.</div>
+        <div class="form-grid" style="grid-template-columns: 1fr 1fr;">
+          <div class="field">
+            <label for="taxcalc-rate-type">Employee type</label>
+            <select id="taxcalc-rate-type" style="width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:14px;">
+              <option value="monthly">Monthly-rate</option>
+              <option value="daily">Daily-rate</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="taxcalc-comp" id="taxcalc-comp-label">Monthly compensation (₱)</label>
+            <input type="number" id="taxcalc-comp" step="0.01" min="0" placeholder="e.g. 30000">
+          </div>
+        </div>
+
+        <table class="sheet-table" style="max-width:480px; margin-top:18px;">
+          <tbody>
+            <tr><td>Monthly compensation</td><td class="num" id="taxcalc-out-comp">₱0.00</td></tr>
+            <tr><td>Less: SSS (employee share)</td><td class="num" id="taxcalc-out-sss">−₱0.00</td></tr>
+            <tr><td>Less: PhilHealth (employee share)</td><td class="num" id="taxcalc-out-philhealth">−₱0.00</td></tr>
+            <tr><td>Less: Pag-IBIG (employee share)</td><td class="num" id="taxcalc-out-pagibig">−₱0.00</td></tr>
+          </tbody>
+          <tfoot>
+            <tr><td>Taxable income</td><td class="num" id="taxcalc-out-taxable" style="font-weight:600;">₱0.00</td></tr>
+            <tr><td>Withholding tax (monthly)</td><td class="num" id="taxcalc-out-tax" style="font-weight:600; color:var(--navy);">₱0.00</td></tr>
+          </tfoot>
+        </table>
+        <div id="taxcalc-bracket-note" style="margin-top:10px; font-size:12px; color:var(--muted);"></div>
+      </div>
+    </section>
+
+    <section id="view-settings" class="view hidden">
+      <div class="panel hidden" id="settings-readonly-notice">
+        <div class="panel-sub" style="margin:0;">This page is restricted to admin accounts. If you're seeing this, your account doesn't have access — statutory settings changes take effect immediately for the whole system once saved.</div>
+      </div>
+      <form id="settings-form">
+        <div class="panel">
+          <h3>SSS</h3>
+          <div class="panel-sub">Monthly Salary Credit (MSC) bracket and contribution rates.</div>
+          <div class="form-grid">
+            <div class="field"><label>Total rate (%)</label><input type="number" id="set-sss-rateTotal" step="0.01" min="0"></div>
+            <div class="field"><label>Employee share of total (%)</label><input type="number" id="set-sss-employeeShare" step="0.01" min="0"></div>
+            <div class="field"><label>MSC floor (₱)</label><input type="number" id="set-sss-mscFloor" step="1" min="0"></div>
+            <div class="field"><label>MSC ceiling (₱)</label><input type="number" id="set-sss-mscCeiling" step="1" min="0"></div>
+            <div class="field"><label>MSC step (₱)</label><input type="number" id="set-sss-mscStep" step="1" min="0"></div>
+            <div class="field"><label>EC threshold MSC (₱)</label><input type="number" id="set-sss-ecThreshold" step="1" min="0"></div>
+            <div class="field"><label>EC below threshold (₱)</label><input type="number" id="set-sss-ecBelow" step="0.01" min="0"></div>
+            <div class="field"><label>EC at/above threshold (₱)</label><input type="number" id="set-sss-ecAtOrAbove" step="0.01" min="0"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>PhilHealth</h3>
+          <div class="form-grid">
+            <div class="field"><label>Total rate (%)</label><input type="number" id="set-ph-rateTotal" step="0.01" min="0"></div>
+            <div class="field"><label>Employee share of total (%)</label><input type="number" id="set-ph-employeeShare" step="0.01" min="0"></div>
+            <div class="field"><label>Salary floor (₱)</label><input type="number" id="set-ph-floor" step="1" min="0"></div>
+            <div class="field"><label>Salary ceiling (₱)</label><input type="number" id="set-ph-ceiling" step="1" min="0"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Pag-IBIG</h3>
+          <div class="form-grid">
+            <div class="field"><label>Low-income rate (%)</label><input type="number" id="set-pi-rateLow" step="0.01" min="0"></div>
+            <div class="field"><label>Standard rate (%)</label><input type="number" id="set-pi-rateStandard" step="0.01" min="0"></div>
+            <div class="field"><label>Low-income threshold (₱)</label><input type="number" id="set-pi-lowThreshold" step="1" min="0"></div>
+            <div class="field"><label>Max fund salary cap (₱)</label><input type="number" id="set-pi-mfsCap" step="1" min="0"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Withholding tax brackets (monthly)</h3>
+          <div class="panel-sub">BIR TRAIN table. Each bracket applies once monthly taxable income reaches its floor.</div>
+          <table>
+            <thead><tr><th>Floor (₱)</th><th>Base tax (₱)</th><th>Rate (%)</th><th></th></tr></thead>
+            <tbody id="settings-tax-tbody"></tbody>
+          </table>
+          <button type="button" class="btn-icon" id="settings-add-tax-row" style="color:var(--navy); margin-top:10px;">+ Add bracket</button>
+        </div>
+
+        <div class="panel">
+          <h3>Pay premium multipliers (DOLE day types)</h3>
+          <div class="panel-sub">Multiplier on the daily rate for a worked day of this type, and the extra multiplier applied to OT hours on that day.</div>
+          <table>
+            <thead><tr><th>Day type</th><th>Worked multiplier (×)</th><th>OT multiplier (×)</th></tr></thead>
+            <tbody id="settings-daytype-tbody"></tbody>
+          </table>
+        </div>
+
+        <div class="panel">
+          <h3>Night shift differential</h3>
+          <div class="form-grid">
+            <div class="field"><label>NSD rate (%)</label><input type="number" id="set-nsd-rate" step="0.01" min="0"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Monthly-rate daily equivalent (DOLE EEMR factor)</h3>
+          <div class="panel-sub">Per the DOLE-BWC Handbook on Workers' Statutory Monetary Benefits: Daily Rate = (Monthly Rate × 12) ÷ Factor. Used for OT, holiday pay, rest day pay, NSD, and unpaid-days deductions for Monthly-rate employees. Common factors: 365 (paid every day), 313 (6-day week), 261 (5-day week, current setting).</div>
+          <div class="form-grid">
+            <div class="field"><label>Factor (days/year)</label><input type="number" id="set-dole-factor" step="1" min="1"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div id="settings-updated-note" style="font-size:12px; color:var(--muted); margin-bottom:14px;"></div>
+          <button type="submit" class="btn-add" id="settings-save-btn">Save all settings</button>
+        </div>
+      </form>
     </section>
   </main>
+</div>
+
+<!-- ===================== PAYROLL SHEET PREVIEW ===================== -->
+<div id="payroll-preview" class="preview-overlay hidden">
+  <div class="preview-toolbar no-print">
+    <div class="preview-toolbar-title">Payroll register preview</div>
+    <div class="preview-toolbar-actions">
+      <button class="btn-add" id="print-sheet-btn">Print / Save as PDF</button>
+      <button class="btn-icon" id="email-sheet-btn" style="color:var(--navy);">Email summary</button>
+      <button class="btn-icon" id="close-preview-btn">Close</button>
+    </div>
+  </div>
+  <div class="preview-sheet" id="preview-sheet-content"></div>
 </div>
 
 </body>
