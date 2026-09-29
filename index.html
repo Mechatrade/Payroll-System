@@ -2879,10 +2879,7 @@
   .main {
     flex: 1;
     padding: 28px 36px 60px;
-    /* No width cap — wide tables (nowrap cells) get the full window to
-       stretch into. A flex item's default min-width (auto) means it still
-       won't shrink below its content, so if a table is wider than the
-       window the whole page scrolls horizontally instead of clipping. */
+    max-width: 1440px;
   }
 
   .topbar {
@@ -2967,14 +2964,14 @@
 
   /* System-wide rule: every data table cell is a single line, never wrapped —
      long content (names, dates, statuses, notes) pushes the table wider
-     instead of breaking mid-word. Nothing scrolls to show it: .main below
-     has no width cap, so the page itself grows as wide as the content needs
-     and the browser window scrolls if it has to, keeping every column
-     visible at a glance instead of hidden behind a boxed-in scrollbar.
-     Excluded: .sheet-table, the printable Payroll Register / Payslip /
-     Report documents — those have a fixed print width (payslip prints at a
-     fixed A5 box) where nowrap could push content past the page edge and get
-     cut off on paper, so they keep normal wrapping. */
+     instead of breaking mid-word. Each table sits in its own .table-scroll
+     (or inline overflow-x:auto) container, so a wide table gets its own
+     horizontal scrollbar without dragging the sidebar/header off-screen the
+     way scrolling the whole page would. Excluded: .sheet-table, the
+     printable Payroll Register / Payslip / Report documents — those have a
+     fixed print width (payslip prints at a fixed A5 box) where nowrap could
+     push content past the page edge and get cut off on paper, so they keep
+     normal wrapping. */
   td {
     padding: 10px 10px;
     border-bottom: 1px solid var(--line);
@@ -2982,7 +2979,7 @@
     white-space: nowrap;
   }
 
-  .table-scroll { overflow-x: visible; }
+  .table-scroll { overflow-x: auto; }
 
   tr:last-child td { border-bottom: none; }
 
@@ -3359,7 +3356,7 @@
       <div class="panel hidden" id="attendance-summary-wrap">
         <h3>Pulled daily records</h3>
         <div class="panel-sub">One row per employee per Mon–Fri workday in the cutoff (Saturdays/Sundays are excluded unless the employee actually worked that day, in which case it's shown and paid normally). Weekday rows with zero PulseTime entries auto-default to Unpaid Leave — change the dropdown per day if it was actually paid, emergency, or a half day. Late isn't auto-calculated (no fixed shift start time); Undertime is based on hours short of 8 worked (after a 1hr unpaid lunch on sessions over an hour).</div>
-        <div style="">
+        <div style="overflow-x:auto;">
         <table>
           <thead><tr>
             <th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th>
@@ -3443,7 +3440,7 @@
           </div>
         </div>
 
-        <div style="margin-top:18px;">
+        <div style="margin-top:18px; overflow-x:auto;">
         <table>
           <thead><tr>
             <th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th><th>Status</th><th>Pay flags</th><th>Actions</th>
@@ -3586,7 +3583,7 @@
 
         <h3 style="font-size:14px; margin-top:24px; margin-bottom:2px;">Monthly-rate employees</h3>
         <div class="panel-sub" style="margin-bottom:12px;">Semi-monthly Base = Monthly Salary ÷ 2, minus Unpaid Days deduction, plus OT/Holiday/Rest Day/NSD/Other Earnings. Holiday, rest day, and NSD pay are pre-filled from attendance using DOLE premium rates — override if needed. Withholding tax is entered manually per employee, per cutoff — type in the amount from your own BIR computation; it's zeroed automatically on a first cutoff like the other statutory deductions.</div>
-        <div style="">
+        <div style="overflow-x:auto;">
         <table>
           <thead>
             <tr>
@@ -3601,7 +3598,7 @@
 
         <h3 style="font-size:14px; margin-top:28px; margin-bottom:2px;">Daily-rate employees</h3>
         <div class="panel-sub" style="margin-bottom:12px;">Basic Pay = Daily Rate × Payable Days, plus OT/Holiday/Rest Day/NSD/Other Earnings. Holiday, rest day, and NSD pay are pre-filled from attendance using DOLE premium rates — override if needed. Withholding tax is entered manually per employee, per cutoff — type in the amount from your own BIR computation; it's zeroed automatically on a first cutoff like the other statutory deductions.</div>
-        <div style="">
+        <div style="overflow-x:auto;">
         <table>
           <thead>
             <tr>
@@ -3688,7 +3685,7 @@
       <div class="panel">
         <h3>Philippine Withholding Tax Table</h3>
         <div class="panel-sub">BIR TRAIN Law brackets, currently in effect (source: whatever's set in Settings — this always reflects the live rates the payroll engine actually uses, not a separate copy).</div>
-        <div style="">
+        <div style="overflow-x:auto;">
         <table>
           <thead><tr><th>Monthly taxable income</th><th class="num">Base tax (monthly)</th><th class="num">Rate on excess</th></tr></thead>
           <tbody id="taxtable-monthly-tbody"></tbody>
@@ -3696,7 +3693,7 @@
         </div>
         <h3 style="font-size:14px; margin-top:24px; margin-bottom:2px;">Annual equivalent</h3>
         <div class="panel-sub" style="margin-bottom:12px;">Same brackets × 12 — the format most commonly published by BIR, for reference.</div>
-        <div style="">
+        <div style="overflow-x:auto;">
         <table>
           <thead><tr><th>Annual taxable income</th><th class="num">Base tax (annual)</th><th class="num">Rate on excess</th></tr></thead>
           <tbody id="taxtable-annual-tbody"></tbody>
