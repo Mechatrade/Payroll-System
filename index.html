@@ -2006,7 +2006,7 @@
     const periodId = document.getElementById('att-period-select').value;
     const tbody = document.getElementById('manual-att-tbody');
     if (!tbody) return;
-    if (!periodId) { manualEntriesCache = []; tbody.innerHTML = `<tr><td colspan="7" class="empty">Select a payroll period above.</td></tr>`; return; }
+    if (!periodId) { manualEntriesCache = []; tbody.innerHTML = `<tr><td colspan="8" class="empty">Select a payroll period above.</td></tr>`; return; }
 
     const q = query(collection(db, 'attendance'), where('period_id', '==', periodId), where('source', '==', 'manual'));
     const snap = await getDocs(q);
@@ -2026,6 +2026,7 @@
           <td style="color:var(--muted);">${r.date}</td>
           <td>${fmtTime(r.time_in)}</td>
           <td>${fmtTime(r.time_out)}</td>
+          <td class="num">${r.is_leave ? '—' : (r.regular_hours || 0).toLocaleString('en-PH', {minimumFractionDigits:2})}</td>
           <td>${statusLabel(r.attendance_status)}${r.is_leave ? ' <span class="tag" style="border-color:var(--red); color:var(--red);">Leave</span>' : ''}</td>
           <td>${flagsHtml || '<span style="color:var(--muted); font-size:11px;">—</span>'}</td>
           <td>
@@ -2033,7 +2034,7 @@
             <button class="btn-icon" style="margin-left:10px;" onclick='__mpDeleteManualEntry("${r.id}")'>Delete</button>
           </td>
         </tr>`;
-    }).join('') || `<tr><td colspan="7" class="empty">No manual entries for this period yet.</td></tr>`;
+    }).join('') || `<tr><td colspan="8" class="empty">No manual entries for this period yet.</td></tr>`;
   }
 
   // Aggregates the saved daily records for one employee/period into the
@@ -2269,6 +2270,7 @@
         <tr data-emp-id="${emp.id}" data-rate-type="monthly" data-ot-multiplier="${otMultiplier}">
           <td>${emp.name}<div style="font-size:11px;color:var(--muted);">₱${emp.rate_amount}/mo${snap ? ' · from attendance records' : ''}</div></td>
           <td><input type="number" class="cell-input" data-field="unpaidDays" value="${unpaidDays}" min="0" step="0.5" style="width:56px;"></td>
+          <td class="num" title="Sum of regular (non-OT) hours rendered this cutoff, from attendance records">${snap ? snap.total_hours.toLocaleString('en-PH', {minimumFractionDigits:2}) : '0.00'}</td>
           <td><input type="number" class="cell-input" data-field="otHours" value="${ot}" min="0" step="0.5" style="width:56px;"></td>
           <td><input type="number" class="cell-input" data-field="holidayPay" value="${premium.holidayPay}" min="0" step="0.01" style="width:70px;"></td>
           <td><input type="number" class="cell-input" data-field="restDayPay" value="${premium.restDayPay}" min="0" step="0.01" style="width:70px;"></td>
@@ -2295,6 +2297,7 @@
         <tr data-emp-id="${emp.id}" data-rate-type="daily" data-ot-multiplier="${otMultiplier}">
           <td>${emp.name}<div style="font-size:11px;color:var(--muted);">₱${emp.rate_amount}/day${snap ? ' · from attendance records' : ''}</div></td>
           <td><input type="number" class="cell-input" data-field="payableDays" value="${days}" min="0" step="0.5" style="width:56px;"></td>
+          <td class="num" title="Sum of regular (non-OT) hours rendered this cutoff, from attendance records">${snap ? snap.total_hours.toLocaleString('en-PH', {minimumFractionDigits:2}) : '0.00'}</td>
           <td><input type="number" class="cell-input" data-field="otHours" value="${ot}" min="0" step="0.5" style="width:56px;"></td>
           <td><input type="number" class="cell-input" data-field="holidayPay" value="${premium.holidayPay}" min="0" step="0.01" style="width:70px;"></td>
           <td><input type="number" class="cell-input" data-field="restDayPay" value="${premium.restDayPay}" min="0" step="0.01" style="width:70px;"></td>
@@ -2309,8 +2312,8 @@
         </tr>`;
     }).join('');
 
-    document.getElementById('processing-tbody-monthly').innerHTML = monthlyRows || `<tr><td colspan="13" class="empty">No active monthly-rate employees.</td></tr>`;
-    document.getElementById('processing-tbody-daily').innerHTML = dailyRows || `<tr><td colspan="13" class="empty">No active daily-rate employees.</td></tr>`;
+    document.getElementById('processing-tbody-monthly').innerHTML = monthlyRows || `<tr><td colspan="14" class="empty">No active monthly-rate employees.</td></tr>`;
+    document.getElementById('processing-tbody-daily').innerHTML = dailyRows || `<tr><td colspan="14" class="empty">No active daily-rate employees.</td></tr>`;
 
     document.querySelectorAll('#processing-tbody-monthly .cell-input, #processing-tbody-daily .cell-input')
       .forEach(inp => inp.addEventListener('input', () => recomputeRow(inp.closest('tr'), period)));
@@ -3773,9 +3776,9 @@
         <div style="margin-top:18px; overflow-x:auto;">
         <table>
           <thead><tr>
-            <th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th><th>Status</th><th>Pay flags</th><th>Actions</th>
+            <th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th><th>Regular Hrs</th><th>Status</th><th>Pay flags</th><th>Actions</th>
           </tr></thead>
-          <tbody id="manual-att-tbody"><tr><td colspan="7" class="empty">Select a payroll period above.</td></tr></tbody>
+          <tbody id="manual-att-tbody"><tr><td colspan="8" class="empty">Select a payroll period above.</td></tr></tbody>
         </table>
         </div>
       </div>
@@ -3966,7 +3969,7 @@
         <table>
           <thead>
             <tr>
-              <th>Employee</th><th>Unpaid days</th><th>OT hours</th>
+              <th>Employee</th><th>Unpaid days</th><th>Total regular hrs.</th><th>OT hours</th>
               <th>Holiday pay (₱)</th><th>Rest day pay (₱)</th><th>NSD pay (₱)</th><th>Other earnings (₱)</th><th>Adjustments</th><th>Tax (₱)</th><th>Cash advance (₱)</th>
               <th class="num">Gross</th><th class="num">Deductions</th><th class="num">Net pay</th>
             </tr>
@@ -3981,7 +3984,7 @@
         <table>
           <thead>
             <tr>
-              <th>Employee</th><th>Payable days</th><th>OT hours</th>
+              <th>Employee</th><th>Payable days</th><th>Total regular hrs.</th><th>OT hours</th>
               <th>Holiday pay (₱)</th><th>Rest day pay (₱)</th><th>NSD pay (₱)</th><th>Other earnings (₱)</th><th>Adjustments</th><th>Tax (₱)</th><th>Cash advance (₱)</th>
               <th class="num">Gross</th><th class="num">Deductions</th><th class="num">Net pay</th>
             </tr>
