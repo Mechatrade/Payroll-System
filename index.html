@@ -489,6 +489,11 @@
     document.getElementById('adj-cancel-btn').addEventListener('click', exitAdjEditMode);
     document.getElementById('adj-period').addEventListener('change', () => loadAdjustments());
 
+    document.getElementById('manual-att-filter-employee').addEventListener('change', (e) => {
+      manualAttEmployeeFilter = e.target.value;
+      renderManualAttTable();
+    });
+
     document.getElementById('taxcalc-comp').addEventListener('input', runTaxCalculator);
     document.getElementById('taxcalc-rate-type').addEventListener('change', runTaxCalculator);
 
@@ -2002,11 +2007,31 @@
     return flags.join(' ');
   }
 
+  // Employee filter for the manual-entry list below — "cutoff" is already
+  // filtered by the shared period selector at the top of Attendance (it's
+  // what loadManualEntries queries Firestore by); this just narrows the
+  // already-fetched list to one employee, client-side, so switching it
+  // doesn't need another Firestore round trip.
+  let manualAttEmployeeFilter = '';
+
+  function populateManualAttEmployeeFilter() {
+    const sel = document.getElementById('manual-att-filter-employee');
+    if (!sel) return;
+    const current = sel.value;
+    const employeesInList = employeesCache
+      .filter(e => manualEntriesCache.some(r => r.employee_id === e.id))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    sel.innerHTML = `<option value="">All employees</option>` +
+      employeesInList.map(e => `<option value="${e.id}">${e.name}</option>`).join('');
+    sel.value = employeesInList.some(e => e.id === current) ? current : '';
+    manualAttEmployeeFilter = sel.value;
+  }
+
   async function loadManualEntries() {
     const periodId = document.getElementById('att-period-select').value;
     const tbody = document.getElementById('manual-att-tbody');
     if (!tbody) return;
-    if (!periodId) { manualEntriesCache = []; tbody.innerHTML = `<tr><td colspan="8" class="empty">Select a payroll period above.</td></tr>`; return; }
+    if (!periodId) { manualEntriesCache = []; tbody.innerHTML = `<tr><td colspan="8" class="empty">Select a payroll period above.</td></tr>`; populateManualAttEmployeeFilter(); return; }
 
     const q = query(collection(db, 'attendance'), where('period_id', '==', periodId), where('source', '==', 'manual'));
     const snap = await getDocs(q);
@@ -2014,10 +2039,21 @@
     snap.forEach(d => manualEntriesCache.push({ id: d.id, ...d.data() }));
     manualEntriesCache.sort((a, b) => a.date.localeCompare(b.date) || (a.employee_id || '').localeCompare(b.employee_id || ''));
 
+    populateManualAttEmployeeFilter();
+    renderManualAttTable();
+  }
+
+  function renderManualAttTable() {
+    const tbody = document.getElementById('manual-att-tbody');
+    if (!tbody) return;
     const fmtTime = (iso) => iso ? new Date(iso).toLocaleTimeString('en-PH', { timeZone: 'Asia/Manila', hour: '2-digit', minute: '2-digit' }) : '—';
     const statusLabel = (v) => (ATTENDANCE_STATUSES.find(s => s.value === v) || {}).label || '—';
 
-    tbody.innerHTML = manualEntriesCache.map(r => {
+    const rowsToShow = manualAttEmployeeFilter
+      ? manualEntriesCache.filter(r => r.employee_id === manualAttEmployeeFilter)
+      : manualEntriesCache;
+
+    tbody.innerHTML = rowsToShow.map(r => {
       const emp = employeesCache.find(e => e.id === r.employee_id);
       const flagsHtml = buildPayFlagsHtml(r);
       return `
@@ -2034,7 +2070,7 @@
             <button class="btn-icon" style="margin-left:10px;" onclick='__mpDeleteManualEntry("${r.id}")'>Delete</button>
           </td>
         </tr>`;
-    }).join('') || `<tr><td colspan="8" class="empty">No manual entries for this period yet.</td></tr>`;
+    }).join('') || `<tr><td colspan="8" class="empty">${manualAttEmployeeFilter ? 'No manual entries for this employee in this period.' : 'No manual entries for this period yet.'}</td></tr>`;
   }
 
   // Aggregates the saved daily records for one employee/period into the
@@ -3773,7 +3809,16 @@
           </div>
         </div>
 
-        <div style="margin-top:18px; overflow-x:auto;">
+        <div style="margin-top:18px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+          <div class="field" style="margin:0;">
+            <label for="manual-att-filter-employee" style="font-size:11.5px;">Filter by employee</label>
+            <select id="manual-att-filter-employee" style="padding:8px 10px; border:1px solid var(--line); background:var(--paper); font-family:inherit; font-size:13.5px; min-width:200px;">
+              <option value="">All employees</option>
+            </select>
+          </div>
+          <div style="font-size:11.5px; color:var(--muted); align-self:flex-end; padding-bottom:9px;">Cutoff follows the payroll period selected above.</div>
+        </div>
+        <div style="margin-top:10px; overflow-x:auto;">
         <table>
           <thead><tr>
             <th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th><th>Regular Hrs</th><th>Status</th><th>Pay flags</th><th>Actions</th>
