@@ -1575,12 +1575,17 @@
   }
 
   function normalizeImportDate(val) {
-    // SheetJS (cellDates:true) hands back date-only cells as a Date anchored
-    // at UTC midnight for that calendar day — read it with UTC getters, or a
-    // browser west of UTC (e.g. PH readers working from a US timezone) rolls
-    // it back a day.
+    // SheetJS (cellDates:true) hands back date-only cells as a Date built
+    // from the browser's LOCAL midnight for that calendar day (confirmed
+    // against the actual xlsx.full.min.js 0.18.5 build used here) — so it
+    // must be read back with local getters, same as the free-form-string
+    // branch below. Reading with UTC getters instead (the previous version
+    // of this function) is correct by coincidence on a machine set to UTC or
+    // west of it, but rolls every date back one day on any machine set EAST
+    // of UTC — e.g. every Mechatrade office PC (Philippines, UTC+8). That
+    // was the cause of the 1-day-early import bug reported Oct 2026.
     if (val instanceof Date && !isNaN(val)) {
-      return `${val.getUTCFullYear()}-${String(val.getUTCMonth() + 1).padStart(2, '0')}-${String(val.getUTCDate()).padStart(2, '0')}`;
+      return `${val.getFullYear()}-${String(val.getMonth() + 1).padStart(2, '0')}-${String(val.getDate()).padStart(2, '0')}`;
     }
     if (typeof val === 'number') return excelSerialToDateKey(val);
     if (typeof val === 'string') {
